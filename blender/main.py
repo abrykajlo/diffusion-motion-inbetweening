@@ -68,7 +68,12 @@ def blender_to_net(pos):
     """Convert Blender coords (X-right, Y-forward, Z-up) to network (X-right, Y-up, Z-forward)."""
     return [pos[0], pos[2], pos[1]]
 
-
+def rest_blender():
+    rest_bl = [net_to_blender(p) for p in REST_POSITIONS_NETWORK]
+    min_z = min(v.z for v in rest_bl)
+    rest_offset = Vector((0, 0, -min_z))
+    rest_bl = [v + rest_offset for v in rest_bl]
+    return rest_bl
 # ---------------------------------------------------------------------------
 # Properties
 # ---------------------------------------------------------------------------
@@ -104,25 +109,39 @@ class DMI_Properties(PropertyGroup):
 # Constraint storage helpers
 # ---------------------------------------------------------------------------
 
-def _get_constraints(scene):
-    """Return the constraints dict from the scene custom property."""
-    raw = scene.get("dmi_constraints", "{}")
-    if isinstance(raw, str):
-        return json.loads(raw)
-    return {}
+CONSTRAINTS_KEY = "dmi_constraints"
 
+class Constraints:
+    def __init__(self, scene):
+        self.scene = scene
+        self.load()
+    
+    def __len__(self):
+        return len(self.data)
 
-def _set_constraints(scene, data):
-    """Store the constraints dict as a scene custom property."""
-    scene["dmi_constraints"] = json.dumps(data)
+    def save(self):
+        self.scene[CONSTRAINTS_KEY] = json.dumps(self.data)
 
+    def load(self):
+        raw = self.scene.get(CONSTRAINTS_KEY, "{}")
+        if isinstance(raw, str):
+            self.data = json.loads(raw)
+        self.data = {}
 
-def _constraint_key(frame, bone_name):
-    return f"{frame}:{bone_name}"
+    def set(self, frame: int, bone: str):
+        if frame not in self.data:
+            self.data[frame] = {}
+        self.data[frame][bone] = True
 
-
-def is_bone_constrained(scene, frame, bone_name):
-    return _constraint_key(frame, bone_name) in _get_constraints(scene)
+    def has(self, frame: int, bone: str):
+        return frame in self.data and self.data[frame][bone]
+    
+    def remove(self, frame: int, bone: str):
+        if frame in self.data:
+            del self.data[frame][bone]
+    
+    def clear(self):
+        self.data = {}
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +156,7 @@ class DMI_OT_CreateArmature(Operator):
 
     def execute(self, context):
         # Compute rest positions in Blender coordinates
-        rest_bl = [net_to_blender(p) for p in REST_POSITIONS_NETWORK]
-
-        # Raise skeleton so feet are at floor level
-        min_z = min(p.z for p in rest_bl)
-        offset = Vector((0, 0, -min_z))
-        rest_bl = [p + offset for p in rest_bl]
+        rest_bl = rest_blender()
 
         # Create armature
         arm_data = bpy.data.armatures.new("DMI_Armature")
@@ -184,7 +198,8 @@ class DMI_OT_CreateArmature(Operator):
         context.scene.render.fps_base = 1.0
 
         # Initialize empty constraint dict
-        _set_constraints(context.scene, {})
+        constraints = Constraints(context.scene)
+        constraints.save()
 
         self.report({'INFO'}, "Created 22-bone SMPL armature")
         return {'FINISHED'}
@@ -203,21 +218,20 @@ class DMI_OT_ToggleConstraint(Operator):
             return {'CANCELLED'}
 
         frame = context.scene.frame_current
-        constraints = _get_constraints(context.scene)
+        constraints = Constraints(context.scene)
         toggled = []
 
         for bone in context.selected_pose_bones or []:
             if bone.name not in HML_JOINT_NAMES:
                 continue
-            key = _constraint_key(frame, bone.name)
-            if key in constraints:
-                del constraints[key]
+            if constraints.has(frame, bone.name):
+                constraints.remove(frame, bone.name)
                 toggled.append(f"-{bone.name}")
             else:
-                constraints[key] = True
+                constraints.set(frame, bone.name)
                 toggled.append(f"+{bone.name}")
 
-        _set_constraints(context.scene, constraints)
+        constraints.save()
 
         if toggled:
             self.report({'INFO'}, f"Frame {frame}: {', '.join(toggled)}")
@@ -234,10 +248,10 @@ class DMI_OT_ConstrainAllBones(Operator):
 
     def execute(self, context):
         frame = context.scene.frame_current
-        constraints = _get_constraints(context.scene)
+        constraints = Constraints(context.scene)
         for name in HML_JOINT_NAMES:
-            constraints[_constraint_key(frame, name)] = True
-        _set_constraints(context.scene, constraints)
+            constraints.set(frame, name)
+        constraints.save()
         self.report({'INFO'}, f"All bones constrained at frame {frame}")
         return {'FINISHED'}
 
@@ -249,7 +263,9 @@ class DMI_OT_ClearAllConstraints(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        _set_constraints(context.scene, {})
+        constraints = Constraints(context.scene)
+        constraints.clear()
+        constraints.save()
         self.report({'INFO'}, "All constraints cleared")
         return {'FINISHED'}
 
@@ -271,18 +287,13 @@ class DMI_OT_Export(Operator):
         joint_positions = np.zeros((n_frames, 22, 3), dtype=np.float32)
         constraint_mask = np.zeros((n_frames, 22), dtype=bool)
 
-        constraints = _get_constraints(context.scene)
-
-        # Compute rest-pose joint positions in Blender coords (for the armature)
-        rest_bl = [net_to_blender(p) for p in REST_POSITIONS_NETWORK]
-        min_z = min(v.z for v in rest_bl)
-        rest_offset = Vector((0, 0, -min_z))
-        rest_bl = [v + rest_offset for v in rest_bl]
+        constraints = Constraints(context.scene)
 
         original_frame = context.scene.frame_current
 
         for fi in range(n_frames):
-            context.scene.frame_set(fi + 1)  # Blender frames are 1-based
+            frame = fi + 1
+            context.scene.frame_set(frame)  # Blender frames are 1-based
             context.view_layer.update()
 
             for ji, name in enumerate(HML_JOINT_NAMES):
@@ -305,8 +316,7 @@ class DMI_OT_Export(Operator):
                 joint_positions[fi, ji] = net_pos
 
                 # Check constraint
-                key = _constraint_key(fi + 1, name)  # frames are 1-based in Blender
-                if key in constraints:
+                if constraints.has(frame, name): # frames are 1-based in Blender
                     constraint_mask[fi, ji] = True
 
         context.scene.frame_set(original_frame)
@@ -353,76 +363,27 @@ class DMI_OT_Import(Operator):
         bpy.ops.object.mode_set(mode='POSE')
 
         # Compute rest-pose data for IK
-        rest_bl = [net_to_blender(p) for p in REST_POSITIONS_NETWORK]
-        min_z = min(v.z for v in rest_bl)
-        rest_offset = Vector((0, 0, -min_z))
-        rest_bl = [v + rest_offset for v in rest_bl]
-
-        # Pre-compute rest-pose bone vectors (parent_pos -> child_pos)
-        rest_bone_dirs = {}
-        for i, name in enumerate(HML_JOINT_NAMES):
-            if JOINT_PARENTS[i] >= 0:
-                parent_pos = rest_bl[JOINT_PARENTS[i]]
-                child_pos = rest_bl[i]
-                rest_bone_dirs[name] = (child_pos - parent_pos).normalized()
-
-        # Set rotation mode to quaternion for all pose bones
-        for pb in obj.pose.bones:
-            pb.rotation_mode = 'QUATERNION'
+        rest_bl = rest_blender()
 
         for fi in range(n_frames):
             frame = fi + 1
             context.scene.frame_set(frame)
 
-            # Convert all positions to Blender coords
             positions_bl = [net_to_blender(joint_positions[fi, ji]) for ji in range(22)]
 
-            # Set root (pelvis) location
-            pelvis_bone = obj.pose.bones.get('pelvis')
-            if pelvis_bone:
-                # Pelvis position in armature-local space
-                armature_inv = obj.matrix_world.inverted()
-                local_pos = armature_inv @ positions_bl[0]
-                # The rest-pose pelvis head position
-                rest_head = rest_bl[0]
-                # Offset from rest
-                pelvis_bone.location = local_pos - rest_head
-                pelvis_bone.keyframe_insert(data_path="location", frame=frame)
+            arm_matrix_inv = obj.matrix_world.inverted()
 
-            # Set bone rotations for non-root bones
-            for i, name in enumerate(HML_JOINT_NAMES):
-                if JOINT_PARENTS[i] < 0:
-                    continue
+            for ji in range(22):
+                bone = obj.pose.bones[HML_JOINT_NAMES[ji]]
+                target_world = positions_bl[ji]
 
-                pose_bone = obj.pose.bones.get(name)
-                if pose_bone is None:
-                    continue
+                if ji == 0:
+                    rest_world = obj.matrix_world @ bone.bone.head_local
+                    delta_local = arm_matrix_inv @ (target_world - rest_world)
+                    bone.location = delta_local
+                    bone.keyframe_insert(data_path="location", frame=frame)
 
-                parent_idx = JOINT_PARENTS[i]
-                target_dir = (positions_bl[i] - positions_bl[parent_idx]).normalized()
-                rest_dir = rest_bone_dirs.get(name)
-
-                if rest_dir is None or target_dir.length < 0.001:
-                    continue
-
-                # Compute rotation from rest direction to target direction
-                rotation = rest_dir.rotation_difference(target_dir)
-
-                # Convert to bone-local space
-                if pose_bone.parent:
-                    # Get parent's accumulated world rotation
-                    parent_world_rot = (obj.matrix_world @ pose_bone.parent.matrix).to_quaternion()
-                    bone_rest_rot = pose_bone.bone.matrix_local.to_quaternion()
-                    parent_rest_rot = pose_bone.parent.bone.matrix_local.to_quaternion()
-
-                    # Local rotation relative to parent
-                    local_rot = parent_rest_rot.inverted() @ rotation @ bone_rest_rot
-                    pose_bone.rotation_quaternion = local_rot
-                else:
-                    pose_bone.rotation_quaternion = rotation
-
-                pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-
+            
         bpy.ops.object.mode_set(mode='OBJECT')
 
         # Update scene frame range
@@ -462,10 +423,10 @@ class DMI_PT_Panel(Panel):
         box.operator("dmi.clear_constraints", text="Clear All", icon='X')
 
         # Show constrained bones at current frame
-        constraints = _get_constraints(context.scene)
+        constraints = Constraints(context.scene)
         frame = context.scene.frame_current
         constrained = [name for name in HML_JOINT_NAMES
-                       if _constraint_key(frame, name) in constraints]
+                       if constraints.has(frame, name)]
         if constrained:
             sub = box.column(align=True)
             sub.label(text=f"Frame {frame} constraints:")
