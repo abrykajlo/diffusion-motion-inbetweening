@@ -362,8 +362,20 @@ class DMI_OT_Import(Operator):
         context.view_layer.objects.active = obj
         bpy.ops.object.mode_set(mode='POSE')
 
-        # Compute rest-pose data for IK
+        # Compute rest-pose data
         rest_bl = rest_blender()
+
+        # Pre-compute rest-pose bone vectors (parent_pos -> child_pos)
+        rest_bone_dirs = {}
+        for i, name in enumerate(HML_JOINT_NAMES):
+            if JOINT_PARENTS[i] >= 0:
+                parent_pos = rest_bl[JOINT_PARENTS[i]]
+                child_pos = rest_bl[i]
+                rest_bone_dirs[name] = (child_pos - parent_pos).normalized()
+
+        # Set rotation mode to quaternion for all pose bones
+        for pb in obj.pose.bones:
+            pb.rotation_mode = 'QUATERNION'
 
         for fi in range(n_frames):
             frame = fi + 1
@@ -373,17 +385,59 @@ class DMI_OT_Import(Operator):
 
             arm_matrix_inv = obj.matrix_world.inverted()
 
-            for ji in range(22):
-                bone = obj.pose.bones[HML_JOINT_NAMES[ji]]
-                target_world = positions_bl[ji]
+            # Set root (pelvis) location
+            pelvis_bone = obj.pose.bones.get('pelvis')
+            if pelvis_bone:
+                local_pos = arm_matrix_inv @ positions_bl[0]
+                rest_head = rest_bl[0]
+                pelvis_bone.location = local_pos - rest_head
+                pelvis_bone.keyframe_insert(data_path="location", frame=frame)
 
-                if ji == 0:
-                    rest_world = obj.matrix_world @ bone.bone.head_local
-                    delta_local = arm_matrix_inv @ (target_world - rest_world)
-                    bone.location = delta_local
-                    bone.keyframe_insert(data_path="location", frame=frame)
+            # Set bone rotations for non-root bones, processing parents before
+            # children so we can account for the parent's accumulated pose rotation
+            parent_world_rots = {}
+            for i, name in enumerate(HML_JOINT_NAMES):
+                if JOINT_PARENTS[i] < 0:
+                    # Store root's world rotation as identity (no rotation applied)
+                    bone_rest_rot = obj.pose.bones[name].bone.matrix_local.to_quaternion()
+                    parent_world_rots[i] = bone_rest_rot
+                    continue
 
-            
+                pose_bone = obj.pose.bones.get(name)
+                if pose_bone is None:
+                    continue
+
+                parent_idx = JOINT_PARENTS[i]
+                target_dir = (positions_bl[i] - positions_bl[parent_idx]).normalized()
+                rest_dir = rest_bone_dirs.get(name)
+
+                if rest_dir is None or target_dir.length < 0.001:
+                    bone_rest_rot = pose_bone.bone.matrix_local.to_quaternion()
+                    parent_world_rots[i] = bone_rest_rot
+                    continue
+
+                # Compute world-space rotation from rest direction to target direction
+                rotation = rest_dir.rotation_difference(target_dir)
+
+                # Convert to bone-local space accounting for parent's posed rotation
+                bone_rest_rot = pose_bone.bone.matrix_local.to_quaternion()
+                parent_posed_rot = parent_world_rots.get(parent_idx, bone_rest_rot)
+                parent_rest_rot = pose_bone.parent.bone.matrix_local.to_quaternion() if pose_bone.parent else bone_rest_rot
+
+                # The bone's local rest rotation relative to parent
+                local_rest_rot = parent_rest_rot.inverted() @ bone_rest_rot
+                # Solve for pose rotation Q:
+                # parent_posed_rot @ local_rest_rot @ Q rotates bone Y-axis to target_dir
+                # So: parent_posed_rot @ local_rest_rot @ Q = rotation @ bone_rest_rot
+                accumulated = parent_posed_rot @ local_rest_rot
+                local_rot = accumulated.inverted() @ rotation @ bone_rest_rot
+                pose_bone.rotation_quaternion = local_rot
+
+                # Track this bone's accumulated world rotation for its children
+                parent_world_rots[i] = accumulated @ local_rot
+
+                pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+
         bpy.ops.object.mode_set(mode='OBJECT')
 
         # Update scene frame range
