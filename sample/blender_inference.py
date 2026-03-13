@@ -407,6 +407,8 @@ def main():
     print(f"Saving {all_positions.shape[0]} sample(s) to: {args.output}")
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
 
+    all_positions = all_positions[:, :, :, [2, 1, 0]]
+
     # Save the first repetition as the primary result (for Blender import)
     np.savez(
         args.output,
