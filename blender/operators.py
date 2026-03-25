@@ -23,6 +23,64 @@ from .skeleton import (
 )
 from .constraints import Constraints
 
+from bpy_extras.io_utils import ExportHelper, ImportHelper
+
+
+# ---------------------------------------------------------------------------
+# Keyframe snapshot helpers
+# ---------------------------------------------------------------------------
+
+def _snapshot_keyframes(obj):
+    """Return a JSON-serialisable snapshot of all DMI bone keyframes on obj."""
+    action = obj.animation_data.action if (obj and obj.animation_data) else None
+    data = {}
+    if not action:
+        return data
+    for name in HML_JOINT_NAMES:
+        bone_data = {}
+        for fcurve in action.fcurves:
+            if f'pose.bones["{name}"]' not in fcurve.data_path:
+                continue
+            dp = fcurve.data_path.rsplit('.', 1)[-1]
+            if dp not in bone_data:
+                bone_data[dp] = []
+            for kp in fcurve.keyframe_points:
+                bone_data[dp].append([int(round(kp.co.x)), fcurve.array_index, kp.co.y])
+        if bone_data:
+            data[name] = bone_data
+    return data
+
+
+def _apply_keyframes(obj, data):
+    """Replace all DMI bone keyframes on obj with the given snapshot."""
+    import json as _json
+    if not obj.animation_data:
+        obj.animation_data_create()
+    action = obj.animation_data.action
+    if not action:
+        action = bpy.data.actions.new("DMI_Action")
+        obj.animation_data.action = action
+
+    # Remove existing DMI fcurves
+    for name in HML_JOINT_NAMES:
+        for fc in [fc for fc in action.fcurves if f'pose.bones["{name}"]' in fc.data_path]:
+            action.fcurves.remove(fc)
+
+    # Re-create from snapshot
+    for name, bone_data in data.items():
+        for dp, triples in bone_data.items():
+            full_dp = f'pose.bones["{name}"].{dp}'
+            by_channel = {}
+            for frame, ch, val in triples:
+                by_channel.setdefault(ch, []).append((frame, val))
+            for ch, points in sorted(by_channel.items()):
+                fc = action.fcurves.new(data_path=full_dp, index=ch)
+                fc.keyframe_points.add(len(points))
+                for i, (frame, val) in enumerate(sorted(points)):
+                    fc.keyframe_points[i].co = (frame, val)
+                    fc.keyframe_points[i].interpolation = 'LINEAR'
+                fc.update()
+
 
 # ---------------------------------------------------------------------------
 # Create armature
@@ -106,6 +164,8 @@ class DMI_OT_ToggleConstraint(Operator):
             else:
                 constraints.set(frame, bone.name)
                 toggled.append(f"+{bone.name}")
+                bone.keyframe_insert(data_path="location", frame=frame)
+                bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
 
         constraints.save()
 
@@ -123,14 +183,19 @@ class DMI_OT_ConstrainAllBones(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        obj = context.active_object
         frame = context.scene.frame_current
         constraints = Constraints(context.scene)
         for name in HML_JOINT_NAMES:
             constraints.set(frame, name)
+            if obj and obj.type == 'ARMATURE':
+                bone = obj.pose.bones.get(name)
+                if bone:
+                    bone.keyframe_insert(data_path="location", frame=frame)
+                    bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
         constraints.save()
         self.report({'INFO'}, f"All bones constrained at frame {frame}")
         return {'FINISHED'}
-
 
 class DMI_OT_ClearAllConstraints(Operator):
     bl_idname = "dmi.clear_constraints"
@@ -139,10 +204,27 @@ class DMI_OT_ClearAllConstraints(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
+        obj = context.active_object
         constraints = Constraints(context.scene)
+
+        action = obj.animation_data.action if (obj and obj.type == 'ARMATURE' and obj.animation_data) else None
+        removed_kf = 0
+
+        if action:
+            for frame_str, bones in constraints.data.items():
+                frame = int(frame_str)
+                for name in bones:
+                    for fcurve in action.fcurves:
+                        if f'pose.bones["{name}"]' not in fcurve.data_path:
+                            continue
+                        for kp in list(fcurve.keyframe_points):
+                            if int(round(kp.co.x)) == frame:
+                                fcurve.keyframe_points.remove(kp)
+                                removed_kf += 1
+
         constraints.clear()
         constraints.save()
-        self.report({'INFO'}, "All constraints cleared")
+        self.report({'INFO'}, f"All constraints cleared (removed {removed_kf} keyframe(s))")
         return {'FINISHED'}
 
 
@@ -150,11 +232,13 @@ class DMI_OT_ClearAllConstraints(Operator):
 # Export
 # ---------------------------------------------------------------------------
 
-class DMI_OT_Export(Operator):
+class DMI_OT_Export(Operator, ExportHelper):
     bl_idname = "dmi.export"
     bl_label = "Export for Inference"
     bl_description = "Export joint positions and constraint mask to NPZ"
     bl_options = {'REGISTER'}
+
+    filename_ext = ".npz"
 
     def execute(self, context):
         props = context.scene.dmi_props
@@ -192,7 +276,7 @@ class DMI_OT_Export(Operator):
 
         context.scene.frame_set(original_frame)
 
-        export_path = bpy.path.abspath(props.export_path)
+        export_path = bpy.path.abspath(self.filepath)
         os.makedirs(
             os.path.dirname(export_path) if os.path.dirname(export_path) else '.',
             exist_ok=True,
@@ -378,7 +462,7 @@ class DMI_OT_RunInference(Operator):
 # Import result
 # ---------------------------------------------------------------------------
 
-class DMI_OT_Import(Operator):
+class DMI_OT_Import(Operator, ImportHelper):
     bl_idname = "dmi.import_result"
     bl_label = "Import Result"
     bl_description = "Load NPZ with joint positions and apply as animation"
@@ -391,10 +475,15 @@ class DMI_OT_Import(Operator):
             self.report({'ERROR'}, "Select the DMI armature first")
             return {'CANCELLED'}
 
-        import_path = bpy.path.abspath(props.import_path)
+        import_path = bpy.path.abspath(self.filepath)
         if not os.path.exists(import_path):
             self.report({'ERROR'}, f"File not found: {import_path}")
             return {'CANCELLED'}
+
+        import json
+
+        # Snapshot current keyframes as the constrained layer before overwriting
+        props.keyframes_constrained = json.dumps(_snapshot_keyframes(obj))
 
         data = np.load(import_path, allow_pickle=True)
         joint_positions = data['joint_positions']  # [n_frames, 22, 3] in network coords
@@ -474,7 +563,76 @@ class DMI_OT_Import(Operator):
         context.scene.frame_start = 1
         context.scene.frame_end = n_frames
 
+        # Snapshot the newly applied keyframes as the inferred layer
+        props.keyframes_inferred = json.dumps(_snapshot_keyframes(obj))
+        props.active_keyframe_layer = 'INFERRED'
+
         self.report({'INFO'}, f"Imported {n_frames} frames from {import_path}")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Keyframe layer switcher
+# ---------------------------------------------------------------------------
+
+class DMI_OT_ApplyKeyframeLayer(Operator):
+    bl_idname = "dmi.apply_keyframe_layer"
+    bl_label = "Switch Keyframe Layer"
+    bl_description = "Replace the armature's keyframes with the stored constrained or inferred set"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    layer: bpy.props.EnumProperty(
+        items=[
+            ('CONSTRAINED', "Constrained", "Restore the keyframes captured when constraints were set"),
+            ('INFERRED',    "Inferred",    "Restore the keyframes produced by the last inference run"),
+        ],
+        name="Layer",
+    )
+
+    def execute(self, context):
+        import json
+
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the DMI armature first")
+            return {'CANCELLED'}
+
+        props = context.scene.dmi_props
+        raw = props.keyframes_constrained if self.layer == 'CONSTRAINED' else props.keyframes_inferred
+
+        if not raw or raw == '{}':
+            self.report({'WARNING'}, f"No stored {self.layer.lower()} keyframes found")
+            return {'CANCELLED'}
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            self.report({'ERROR'}, "Stored keyframe data is corrupted")
+            return {'CANCELLED'}
+
+        _apply_keyframes(obj, data)
+        props.active_keyframe_layer = self.layer
+        self.report({'INFO'}, f"Switched to {self.layer.lower()} keyframes")
+        return {'FINISHED'}
+
+
+class DMI_OT_SnapshotConstraintKeyframes(Operator):
+    bl_idname = "dmi.snapshot_constraint_keyframes"
+    bl_label = "Snapshot as Constrained"
+    bl_description = "Save the armature's current keyframes as the constrained layer"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        import json
+
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the DMI armature first")
+            return {'CANCELLED'}
+
+        context.scene.dmi_props.keyframes_constrained = json.dumps(_snapshot_keyframes(obj))
+        context.scene.dmi_props.active_keyframe_layer = 'CONSTRAINED'
+        self.report({'INFO'}, "Constrained keyframes snapshot saved")
         return {'FINISHED'}
 
 
@@ -490,4 +648,6 @@ classes = (
     DMI_OT_Export,
     DMI_OT_RunInference,
     DMI_OT_Import,
+    DMI_OT_ApplyKeyframeLayer,
+    DMI_OT_SnapshotConstraintKeyframes,
 )

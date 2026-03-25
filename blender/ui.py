@@ -3,7 +3,7 @@ Blender UI: addon preferences, scene properties, and the sidebar panel.
 """
 
 import bpy
-from bpy.props import StringProperty, IntProperty, FloatProperty, PointerProperty
+from bpy.props import StringProperty, IntProperty, FloatProperty, PointerProperty, BoolProperty, EnumProperty
 from bpy.types import AddonPreferences, PropertyGroup, Panel
 
 from .skeleton import HML_JOINT_NAMES
@@ -59,18 +59,6 @@ class DMI_Properties(PropertyGroup):
         description="Text description for motion generation",
         default="a person walks forward",
     )
-    export_path: StringProperty(
-        name="Export Path",
-        description="Path to save the NPZ export file",
-        default="//dmi_export.npz",
-        subtype='FILE_PATH',
-    )
-    import_path: StringProperty(
-        name="Import Path",
-        description="Path to the NPZ result file to import",
-        default="//dmi_result.npz",
-        subtype='FILE_PATH',
-    )
     frame_count: IntProperty(
         name="Frame Count",
         description="Number of frames to export (at 20 FPS)",
@@ -97,6 +85,20 @@ class DMI_Properties(PropertyGroup):
         description="Random seed for reproducibility",
         default=10,
     )
+    show_constraint_list: BoolProperty(
+        name="Show Constrained Bones",
+        default=False,
+    )
+    active_keyframe_layer: EnumProperty(
+        name="Active Layer",
+        items=[
+            ('CONSTRAINED', "Constrained", "Keyframes from when constraints were set"),
+            ('INFERRED',    "Inferred",    "Keyframes produced by the last inference run"),
+        ],
+        default='CONSTRAINED',
+    )
+    keyframes_constrained: StringProperty(default='{}')
+    keyframes_inferred: StringProperty(default='{}')
 
 
 # ---------------------------------------------------------------------------
@@ -130,22 +132,29 @@ class DMI_PT_Panel(Panel):
         constraints = Constraints(context.scene)
         frame = context.scene.frame_current
         constrained = [name for name in HML_JOINT_NAMES if constraints.has(frame, name)]
-        if constrained:
-            sub = box.column(align=True)
-            sub.label(text=f"Frame {frame} constraints:")
-            for name in constrained:
-                sub.label(text=f"  {name}", icon='CONSTRAINT_BONE')
-
         total = len(constraints)
-        if total > 0:
-            box.label(text=f"Total constraint markers: {total}")
+
+        if constrained or total > 0:
+            summary = f"{len(constrained)} bone(s) at frame {frame}"
+            if total > 0:
+                summary += f"  |  {total} total"
+            row = box.row()
+            row.prop(
+                props, "show_constraint_list",
+                icon='TRIA_DOWN' if props.show_constraint_list else 'TRIA_RIGHT',
+                text=summary,
+                emboss=False,
+            )
+            if props.show_constraint_list and constrained:
+                sub = box.column(align=True)
+                for name in constrained:
+                    sub.label(text=f"  {name}", icon='CONSTRAINT_BONE')
 
         # --- Export ---
         box = layout.box()
         box.label(text="Export", icon='EXPORT')
         box.prop(props, "text_prompt")
         box.prop(props, "frame_count")
-        box.prop(props, "export_path")
         box.operator("dmi.export", icon='FILE_TICK')
 
         # --- Inference ---
@@ -154,12 +163,40 @@ class DMI_PT_Panel(Panel):
         box.prop(props, "guidance_param")
         box.prop(props, "num_repetitions")
         box.prop(props, "seed")
-        box.prop(props, "import_path")
         op_row = box.row(align=True)
         op_row.operator("dmi.run_inference", text="Run Inference", icon='SHADERFX')
 
         # --- Import ---
         box = layout.box()
         box.label(text="Import", icon='IMPORT')
-        box.prop(props, "import_path")
         box.operator("dmi.import_result", icon='FILE_REFRESH')
+
+        # --- Keyframe Layers ---
+        box = layout.box()
+        box.label(text="Keyframe Layers", icon='DECORATE_KEYFRAME')
+
+        has_constrained = bool(props.keyframes_constrained and props.keyframes_constrained != '{}')
+        has_inferred    = bool(props.keyframes_inferred    and props.keyframes_inferred    != '{}')
+
+        row = box.row(align=True)
+        sub = row.row(align=True)
+        sub.enabled = has_constrained
+        op = sub.operator(
+            "dmi.apply_keyframe_layer",
+            text="Constrained",
+            icon='KEYFRAME' if props.active_keyframe_layer == 'CONSTRAINED' else 'KEYFRAME_HLT',
+            depress=(props.active_keyframe_layer == 'CONSTRAINED'),
+        )
+        op.layer = 'CONSTRAINED'
+
+        sub = row.row(align=True)
+        sub.enabled = has_inferred
+        op = sub.operator(
+            "dmi.apply_keyframe_layer",
+            text="Inferred",
+            icon='KEYFRAME' if props.active_keyframe_layer == 'INFERRED' else 'KEYFRAME_HLT',
+            depress=(props.active_keyframe_layer == 'INFERRED'),
+        )
+        op.layer = 'INFERRED'
+
+        box.operator("dmi.snapshot_constraint_keyframes", text="Snapshot as Constrained", icon='PINNED')
