@@ -14,7 +14,7 @@ bl_info = {
 import bpy
 from bpy.props import PointerProperty
 
-from .ui import DMI_AddonPreferences, DMI_Properties, DMI_PT_Panel
+from .ui import DMI_AddonPreferences, DMI_Properties, DMI_PT_Panel, load_prefs
 from .operators import classes as operator_classes
 
 
@@ -30,6 +30,8 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.dmi_props = PointerProperty(type=DMI_Properties)
+    prefs = bpy.context.preferences.addons[__package__].preferences
+    load_prefs(prefs)
 
 
 def unregister():

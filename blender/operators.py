@@ -341,8 +341,11 @@ class DMI_OT_RunInference(Operator):
             return {'CANCELLED'}
 
         props = context.scene.dmi_props
-        export_path = bpy.path.abspath(props.export_path)
-        import_path = bpy.path.abspath(props.import_path)
+        inferences_dir = os.path.join(bpy.path.abspath(prefs.project_path), "blender_inferences")
+        os.makedirs(inferences_dir, exist_ok=True)
+        name = props.inference_name or "inference"
+        export_path = os.path.join(inferences_dir, f"{name}_export.npz")
+        import_path = os.path.join(inferences_dir, f"{name}_result.npz")
 
         # 1. Run export first
         try:
@@ -446,8 +449,12 @@ class DMI_OT_RunInference(Operator):
             return {'CANCELLED'}
 
         # 5. Auto-import result
+        prefs = self._get_prefs(context)
         props = context.scene.dmi_props
-        import_path = bpy.path.abspath(props.import_path)
+        name = props.inference_name or "inference"
+        import_path = os.path.join(
+            bpy.path.abspath(prefs.project_path), "blender_inferences", f"{name}_result.npz"
+        )
         try:
             import_npz(import_path, context)
             self.report({'INFO'}, "Inference complete and result imported.")

@@ -2,12 +2,50 @@
 Blender UI: addon preferences, scene properties, and the sidebar panel.
 """
 
+import json
+import os
+
 import bpy
 from bpy.props import StringProperty, IntProperty, FloatProperty, PointerProperty, BoolProperty, EnumProperty
 from bpy.types import AddonPreferences, PropertyGroup, Panel
 
 from .skeleton import HML_JOINT_NAMES
 from .constraints import Constraints
+
+
+# ---------------------------------------------------------------------------
+# Preferences dotfile persistence
+# ---------------------------------------------------------------------------
+
+_PREFS_KEYS = ("python_path", "project_path", "model_path")
+
+def _prefs_path():
+    base = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return os.path.join(base, ".dmi_prefs.json")
+
+
+def save_prefs(prefs):
+    data = {k: getattr(prefs, k) for k in _PREFS_KEYS}
+    try:
+        with open(_prefs_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def load_prefs(prefs):
+    try:
+        with open(_prefs_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    for k in _PREFS_KEYS:
+        if k in data:
+            setattr(prefs, k, data[k])
+
+
+def _on_pref_update(self, context):
+    save_prefs(self)
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +63,7 @@ class DMI_AddonPreferences(AddonPreferences):
         ),
         default="python",
         subtype='FILE_PATH',
+        update=_on_pref_update,
     )
 
     project_path: StringProperty(
@@ -32,6 +71,7 @@ class DMI_AddonPreferences(AddonPreferences):
         description="Absolute path to the diffusion-motion-inbetweening repository root",
         default="",
         subtype='DIR_PATH',
+        update=_on_pref_update,
     )
 
     model_path: StringProperty(
@@ -39,6 +79,7 @@ class DMI_AddonPreferences(AddonPreferences):
         description="Path to the .pt model checkpoint file",
         default="",
         subtype='FILE_PATH',
+        update=_on_pref_update,
     )
 
     def draw(self, context):
@@ -84,6 +125,11 @@ class DMI_Properties(PropertyGroup):
         name="Seed",
         description="Random seed for reproducibility",
         default=10,
+    )
+    inference_name: StringProperty(
+        name="Name",
+        description="Name used for export/result NPZ files (saved to <project>/blender_inferences/)",
+        default="inference",
     )
     show_constraint_list: BoolProperty(
         name="Show Constrained Bones",
@@ -150,21 +196,22 @@ class DMI_PT_Panel(Panel):
                 for name in constrained:
                     sub.label(text=f"  {name}", icon='CONSTRAINT_BONE')
 
+        # --- Inference ---
+        box = layout.box()
+        box.label(text="Inference", icon='PLAY')
+        box.prop(props, "inference_name")
+        box.prop(props, "guidance_param")
+        box.prop(props, "num_repetitions")
+        box.prop(props, "seed")
+        op_row = box.row(align=True)
+        op_row.operator("dmi.run_inference", text="Run Inference", icon='SHADERFX')
+        
         # --- Export ---
         box = layout.box()
         box.label(text="Export", icon='EXPORT')
         box.prop(props, "text_prompt")
         box.prop(props, "frame_count")
         box.operator("dmi.export", icon='FILE_TICK')
-
-        # --- Inference ---
-        box = layout.box()
-        box.label(text="Inference", icon='PLAY')
-        box.prop(props, "guidance_param")
-        box.prop(props, "num_repetitions")
-        box.prop(props, "seed")
-        op_row = box.row(align=True)
-        op_row.operator("dmi.run_inference", text="Run Inference", icon='SHADERFX')
 
         # --- Import ---
         box = layout.box()
