@@ -232,6 +232,53 @@ class DMI_OT_ClearAllConstraints(Operator):
 # Export
 # ---------------------------------------------------------------------------
 
+def export_npz(filepath, context):
+    """Export joint positions and constraint mask to an NPZ file at filepath."""
+    props = context.scene.dmi_props
+    obj = context.active_object
+
+    n_frames = props.frame_count
+    joint_positions = np.zeros((n_frames, 22, 3), dtype=np.float32)
+    constraint_mask = np.zeros((n_frames, 22), dtype=bool)
+
+    constraints = Constraints(context.scene)
+    original_frame = context.scene.frame_current
+
+    for fi in range(n_frames):
+        frame = fi + 1
+        context.scene.frame_set(frame)
+        context.view_layer.update()
+
+        for ji, name in enumerate(HML_JOINT_NAMES):
+            pose_bone = obj.pose.bones.get(name)
+            if pose_bone is None:
+                continue
+
+            if ji == 0:
+                world_pos = obj.matrix_world @ pose_bone.head
+            else:
+                world_pos = obj.matrix_world @ pose_bone.tail
+
+            joint_positions[fi, ji] = blender_to_net(world_pos)
+
+            if constraints.has(frame, name):
+                constraint_mask[fi, ji] = True
+
+    context.scene.frame_set(original_frame)
+
+    os.makedirs(
+        os.path.dirname(filepath) if os.path.dirname(filepath) else '.',
+        exist_ok=True,
+    )
+    np.savez(
+        filepath,
+        joint_positions=joint_positions,
+        constraint_mask=constraint_mask,
+        text_prompt=props.text_prompt,
+        fps=20,
+    )
+
+
 class DMI_OT_Export(Operator, ExportHelper):
     bl_idname = "dmi.export"
     bl_label = "Export for Inference"
@@ -241,55 +288,16 @@ class DMI_OT_Export(Operator, ExportHelper):
     filename_ext = ".npz"
 
     def execute(self, context):
-        props = context.scene.dmi_props
         obj = context.active_object
         if not obj or obj.type != 'ARMATURE':
             self.report({'ERROR'}, "Select the DMI armature first")
             return {'CANCELLED'}
 
-        n_frames = props.frame_count
-        joint_positions = np.zeros((n_frames, 22, 3), dtype=np.float32)
-        constraint_mask = np.zeros((n_frames, 22), dtype=bool)
-
-        constraints = Constraints(context.scene)
-        original_frame = context.scene.frame_current
-
-        for fi in range(n_frames):
-            frame = fi + 1
-            context.scene.frame_set(frame)
-            context.view_layer.update()
-
-            for ji, name in enumerate(HML_JOINT_NAMES):
-                pose_bone = obj.pose.bones.get(name)
-                if pose_bone is None:
-                    continue
-
-                if ji == 0:
-                    world_pos = obj.matrix_world @ pose_bone.head
-                else:
-                    world_pos = obj.matrix_world @ pose_bone.tail
-
-                joint_positions[fi, ji] = blender_to_net(world_pos)
-
-                if constraints.has(frame, name):
-                    constraint_mask[fi, ji] = True
-
-        context.scene.frame_set(original_frame)
-
-        export_path = bpy.path.abspath(self.filepath)
-        os.makedirs(
-            os.path.dirname(export_path) if os.path.dirname(export_path) else '.',
-            exist_ok=True,
-        )
-        np.savez(
-            export_path,
-            joint_positions=joint_positions,
-            constraint_mask=constraint_mask,
-            text_prompt=props.text_prompt,
-            fps=20,
-        )
-
-        self.report({'INFO'}, f"Exported {n_frames} frames to {export_path}")
+        filepath = bpy.path.abspath(self.filepath)
+        export_npz(filepath, context)
+        
+        props = context.scene.dmi_props
+        self.report({'INFO'}, f"Exported {props.frame_count} frames to {filepath}")
         return {'FINISHED'}
 
 
@@ -332,18 +340,15 @@ class DMI_OT_RunInference(Operator):
             self.report({'ERROR'}, "Select the DMI armature first")
             return {'CANCELLED'}
 
-        # 1. Run export first
-        result = bpy.ops.dmi.export()
-        if result != {'FINISHED'}:
-            self.report({'ERROR'}, "Export failed – see console for details")
-            return {'CANCELLED'}
-
         props = context.scene.dmi_props
         export_path = bpy.path.abspath(props.export_path)
         import_path = bpy.path.abspath(props.import_path)
 
-        if not os.path.exists(export_path):
-            self.report({'ERROR'}, f"Export file not found: {export_path}")
+        # 1. Run export first
+        try:
+            export_npz(export_path, context)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Export failed: {exc}")
             return {'CANCELLED'}
 
         # 2. Build subprocess command
@@ -441,11 +446,13 @@ class DMI_OT_RunInference(Operator):
             return {'CANCELLED'}
 
         # 5. Auto-import result
-        result = bpy.ops.dmi.import_result()
-        if result == {'FINISHED'}:
+        props = context.scene.dmi_props
+        import_path = bpy.path.abspath(props.import_path)
+        try:
+            import_npz(import_path, context)
             self.report({'INFO'}, "Inference complete and result imported.")
-        else:
-            self.report({'WARNING'}, "Inference complete but import failed – check Import Path.")
+        except Exception as exc:
+            self.report({'WARNING'}, f"Inference complete but import failed: {exc}")
 
         return {'FINISHED'}
 
@@ -462,6 +469,100 @@ class DMI_OT_RunInference(Operator):
 # Import result
 # ---------------------------------------------------------------------------
 
+def import_npz(filepath, context):
+    """Load an NPZ file and apply joint positions as animation on the active armature."""
+    import json
+
+    props = context.scene.dmi_props
+    obj = context.active_object
+
+    data = np.load(filepath, allow_pickle=True)
+    joint_positions = data['joint_positions']  # [n_frames, 22, 3] in network coords
+    n_frames = joint_positions.shape[0]
+
+    # Snapshot current keyframes as the constrained layer before overwriting
+    props.keyframes_constrained = json.dumps(_snapshot_keyframes(obj))
+
+    context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='POSE')
+
+    rest_bl = rest_blender()
+
+    # Pre-compute rest-pose bone directions (parent→child)
+    rest_bone_dirs = {}
+    for i, name in enumerate(HML_JOINT_NAMES):
+        if JOINT_PARENTS[i] >= 0:
+            parent_pos = rest_bl[JOINT_PARENTS[i]]
+            child_pos = rest_bl[i]
+            rest_bone_dirs[name] = (child_pos - parent_pos).normalized()
+
+    for pb in obj.pose.bones:
+        pb.rotation_mode = 'QUATERNION'
+
+    for fi in range(n_frames):
+        frame = fi + 1
+        context.scene.frame_set(frame)
+
+        positions_bl = [net_to_blender(joint_positions[fi, ji]) for ji in range(22)]
+        arm_matrix_inv = obj.matrix_world.inverted()
+
+        # Root (pelvis) location
+        pelvis_bone = obj.pose.bones.get('pelvis')
+        if pelvis_bone:
+            local_pos = arm_matrix_inv @ positions_bl[0]
+            rest_head = rest_bl[0]
+            pelvis_bone.location = local_pos - rest_head
+            pelvis_bone.keyframe_insert(data_path="location", frame=frame)
+
+        # Bone rotations (process parents before children)
+        parent_world_rots = {}
+        for i, name in enumerate(HML_JOINT_NAMES):
+            if JOINT_PARENTS[i] < 0:
+                bone_rest_rot = obj.pose.bones[name].bone.matrix_local.to_quaternion()
+                parent_world_rots[i] = bone_rest_rot
+                continue
+
+            pose_bone = obj.pose.bones.get(name)
+            if pose_bone is None:
+                continue
+
+            parent_idx = JOINT_PARENTS[i]
+            target_dir = (positions_bl[i] - positions_bl[parent_idx]).normalized()
+            rest_dir = rest_bone_dirs.get(name)
+
+            if rest_dir is None or target_dir.length < 0.001:
+                bone_rest_rot = pose_bone.bone.matrix_local.to_quaternion()
+                parent_world_rots[i] = bone_rest_rot
+                continue
+
+            rotation = rest_dir.rotation_difference(target_dir)
+
+            bone_rest_rot = pose_bone.bone.matrix_local.to_quaternion()
+            parent_posed_rot = parent_world_rots.get(parent_idx, bone_rest_rot)
+            parent_rest_rot = (
+                pose_bone.parent.bone.matrix_local.to_quaternion()
+                if pose_bone.parent else bone_rest_rot
+            )
+
+            local_rest_rot = parent_rest_rot.inverted() @ bone_rest_rot
+            accumulated = parent_posed_rot @ local_rest_rot
+            local_rot = accumulated.inverted() @ rotation @ bone_rest_rot
+            pose_bone.rotation_quaternion = local_rot
+            parent_world_rots[i] = accumulated @ local_rot
+
+            pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    context.scene.frame_start = 1
+    context.scene.frame_end = n_frames
+
+    # Snapshot the newly applied keyframes as the inferred layer
+    props.keyframes_inferred = json.dumps(_snapshot_keyframes(obj))
+    props.active_keyframe_layer = 'INFERRED'
+
+
+
 class DMI_OT_Import(Operator, ImportHelper):
     bl_idname = "dmi.import_result"
     bl_label = "Import Result"
@@ -469,105 +570,19 @@ class DMI_OT_Import(Operator, ImportHelper):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        props = context.scene.dmi_props
         obj = context.active_object
         if not obj or obj.type != 'ARMATURE':
             self.report({'ERROR'}, "Select the DMI armature first")
             return {'CANCELLED'}
 
-        import_path = bpy.path.abspath(self.filepath)
-        if not os.path.exists(import_path):
-            self.report({'ERROR'}, f"File not found: {import_path}")
+        filepath = bpy.path.abspath(self.filepath)
+        if not os.path.exists(filepath):
+            self.report({'ERROR'}, f"File not found: {filepath}")
             return {'CANCELLED'}
 
-        import json
-
-        # Snapshot current keyframes as the constrained layer before overwriting
-        props.keyframes_constrained = json.dumps(_snapshot_keyframes(obj))
-
-        data = np.load(import_path, allow_pickle=True)
-        joint_positions = data['joint_positions']  # [n_frames, 22, 3] in network coords
-        n_frames = joint_positions.shape[0]
-
-        context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='POSE')
-
-        rest_bl = rest_blender()
-
-        # Pre-compute rest-pose bone directions (parent→child)
-        rest_bone_dirs = {}
-        for i, name in enumerate(HML_JOINT_NAMES):
-            if JOINT_PARENTS[i] >= 0:
-                parent_pos = rest_bl[JOINT_PARENTS[i]]
-                child_pos = rest_bl[i]
-                rest_bone_dirs[name] = (child_pos - parent_pos).normalized()
-
-        for pb in obj.pose.bones:
-            pb.rotation_mode = 'QUATERNION'
-
-        for fi in range(n_frames):
-            frame = fi + 1
-            context.scene.frame_set(frame)
-
-            positions_bl = [net_to_blender(joint_positions[fi, ji]) for ji in range(22)]
-            arm_matrix_inv = obj.matrix_world.inverted()
-
-            # Root (pelvis) location
-            pelvis_bone = obj.pose.bones.get('pelvis')
-            if pelvis_bone:
-                local_pos = arm_matrix_inv @ positions_bl[0]
-                rest_head = rest_bl[0]
-                pelvis_bone.location = local_pos - rest_head
-                pelvis_bone.keyframe_insert(data_path="location", frame=frame)
-
-            # Bone rotations (process parents before children)
-            parent_world_rots = {}
-            for i, name in enumerate(HML_JOINT_NAMES):
-                if JOINT_PARENTS[i] < 0:
-                    bone_rest_rot = obj.pose.bones[name].bone.matrix_local.to_quaternion()
-                    parent_world_rots[i] = bone_rest_rot
-                    continue
-
-                pose_bone = obj.pose.bones.get(name)
-                if pose_bone is None:
-                    continue
-
-                parent_idx = JOINT_PARENTS[i]
-                target_dir = (positions_bl[i] - positions_bl[parent_idx]).normalized()
-                rest_dir = rest_bone_dirs.get(name)
-
-                if rest_dir is None or target_dir.length < 0.001:
-                    bone_rest_rot = pose_bone.bone.matrix_local.to_quaternion()
-                    parent_world_rots[i] = bone_rest_rot
-                    continue
-
-                rotation = rest_dir.rotation_difference(target_dir)
-
-                bone_rest_rot = pose_bone.bone.matrix_local.to_quaternion()
-                parent_posed_rot = parent_world_rots.get(parent_idx, bone_rest_rot)
-                parent_rest_rot = (
-                    pose_bone.parent.bone.matrix_local.to_quaternion()
-                    if pose_bone.parent else bone_rest_rot
-                )
-
-                local_rest_rot = parent_rest_rot.inverted() @ bone_rest_rot
-                accumulated = parent_posed_rot @ local_rest_rot
-                local_rot = accumulated.inverted() @ rotation @ bone_rest_rot
-                pose_bone.rotation_quaternion = local_rot
-                parent_world_rots[i] = accumulated @ local_rot
-
-                pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-        context.scene.frame_start = 1
-        context.scene.frame_end = n_frames
-
-        # Snapshot the newly applied keyframes as the inferred layer
-        props.keyframes_inferred = json.dumps(_snapshot_keyframes(obj))
-        props.active_keyframe_layer = 'INFERRED'
-
-        self.report({'INFO'}, f"Imported {n_frames} frames from {import_path}")
+        import_npz(filepath, context)
+        props = context.scene.dmi_props
+        self.report({'INFO'}, f"Imported {props.frame_count} frames from {filepath}")
         return {'FINISHED'}
 
 
