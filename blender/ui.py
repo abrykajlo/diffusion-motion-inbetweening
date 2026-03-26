@@ -145,6 +145,15 @@ class DMI_Properties(PropertyGroup):
     )
     keyframes_constrained: StringProperty(default='{}')
     keyframes_inferred: StringProperty(default='{}')
+    import_source: EnumProperty(
+        name="Source",
+        description="File format to import",
+        items=[
+            ('NPZ', "DMI NPZ", "NPZ file exported and processed by the DMI addon"),
+            ('HML3D', "HumanML3D", "Raw .npy file from the HumanML3D dataset (joint positions or 263-dim features)"),
+        ],
+        default='NPZ',
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +225,7 @@ class DMI_PT_Panel(Panel):
         # --- Import ---
         box = layout.box()
         box.label(text="Import", icon='IMPORT')
+        box.prop(props, "import_source")
         box.operator("dmi.import_result", icon='FILE_REFRESH')
 
         # --- Keyframe Layers ---

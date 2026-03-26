@@ -476,18 +476,18 @@ class DMI_OT_RunInference(Operator):
 # Import result
 # ---------------------------------------------------------------------------
 
-def import_npz(filepath, context):
-    """Load an NPZ file and apply joint positions as animation on the active armature."""
+def _apply_joint_positions(joint_positions, context):
+    """Apply a (n_frames, 22, 3) array of network-coord joint positions as animation.
+
+    Snapshots current keyframes as the constrained layer, writes the new animation,
+    then snapshots the result as the inferred layer. Returns n_frames.
+    """
     import json
 
     props = context.scene.dmi_props
     obj = context.active_object
-
-    data = np.load(filepath, allow_pickle=True)
-    joint_positions = data['joint_positions']  # [n_frames, 22, 3] in network coords
     n_frames = joint_positions.shape[0]
 
-    # Snapshot current keyframes as the constrained layer before overwriting
     props.keyframes_constrained = json.dumps(_snapshot_keyframes(obj))
 
     context.view_layer.objects.active = obj
@@ -495,7 +495,6 @@ def import_npz(filepath, context):
 
     rest_bl = rest_blender()
 
-    # Pre-compute rest-pose bone directions (parent→child)
     rest_bone_dirs = {}
     for i, name in enumerate(HML_JOINT_NAMES):
         if JOINT_PARENTS[i] >= 0:
@@ -513,7 +512,6 @@ def import_npz(filepath, context):
         positions_bl = [net_to_blender(joint_positions[fi, ji]) for ji in range(22)]
         arm_matrix_inv = obj.matrix_world.inverted()
 
-        # Root (pelvis) location
         pelvis_bone = obj.pose.bones.get('pelvis')
         if pelvis_bone:
             local_pos = arm_matrix_inv @ positions_bl[0]
@@ -521,7 +519,6 @@ def import_npz(filepath, context):
             pelvis_bone.location = local_pos - rest_head
             pelvis_bone.keyframe_insert(data_path="location", frame=frame)
 
-        # Bone rotations (process parents before children)
         parent_world_rots = {}
         for i, name in enumerate(HML_JOINT_NAMES):
             if JOINT_PARENTS[i] < 0:
@@ -564,17 +561,115 @@ def import_npz(filepath, context):
     context.scene.frame_start = 1
     context.scene.frame_end = n_frames
 
-    # Snapshot the newly applied keyframes as the inferred layer
     props.keyframes_inferred = json.dumps(_snapshot_keyframes(obj))
     props.active_keyframe_layer = 'INFERRED'
+
+    return n_frames
+
+
+def import_npz(filepath, context):
+    """Load joint positions from a DMI NPZ file and apply as animation."""
+    data = np.load(filepath, allow_pickle=True)
+    joint_positions = data['joint_positions']  # [n_frames, 22, 3] network coords
+    return _apply_joint_positions(joint_positions, context)
+
+
+# ---------------------------------------------------------------------------
+# HumanML3D numpy helpers
+# ---------------------------------------------------------------------------
+
+def _qrot_np(q, v):
+    """Rotate vectors v (..., 3) by unit quaternions q (..., 4) [w, x, y, z]."""
+    qvec = q[..., 1:]
+    uv = np.cross(qvec, v)
+    uuv = np.cross(qvec, uv)
+    return v + 2.0 * (q[..., :1] * uv + uuv)
+
+
+def _qinv_np(q):
+    """Invert unit quaternions by negating the xyz components."""
+    inv = q.copy()
+    inv[..., 1:] *= -1.0
+    return inv
+
+
+def _recover_from_ric_np(data, joints_num=22):
+    """Numpy reimplementation of recover_from_ric.
+
+    data: (seq_len, 263) HumanML3D feature vectors
+    Returns: (seq_len, joints_num, 3) joint positions in network coords (Y-up, Z-forward)
+    """
+    # --- root rotation (Y-axis) ---
+    rot_vel = data[:, 0]
+    r_rot_ang = np.zeros_like(rot_vel)
+    r_rot_ang[1:] = rot_vel[:-1]
+    r_rot_ang = np.cumsum(r_rot_ang)
+
+    r_rot_quat = np.zeros((len(data), 4), dtype=np.float32)
+    r_rot_quat[:, 0] = np.cos(r_rot_ang)  # w
+    r_rot_quat[:, 2] = np.sin(r_rot_ang)  # y (rotation around Y axis)
+
+    # --- root position ---
+    r_pos = np.zeros((len(data), 3), dtype=np.float32)
+    r_pos[1:, [0, 2]] = data[:-1, 1:3]
+    r_pos = _qrot_np(_qinv_np(r_rot_quat), r_pos)
+    r_pos = np.cumsum(r_pos, axis=0)
+    r_pos[:, 1] = data[:, 3]
+
+    # --- RIC joint positions (non-root) ---
+    positions = data[:, 4:(joints_num - 1) * 3 + 4].reshape(len(data), joints_num - 1, 3)
+
+    # Apply root Y-axis rotation to local joint positions
+    r_rot_exp = np.tile(r_rot_quat[:, np.newaxis, :], (1, joints_num - 1, 1))
+    positions = _qrot_np(_qinv_np(r_rot_exp), positions)
+
+    # Add root XZ offset
+    positions[:, :, 0] += r_pos[:, 0:1]
+    positions[:, :, 2] += r_pos[:, 2:3]
+
+    # Prepend root joint
+    return np.concatenate([r_pos[:, np.newaxis, :], positions], axis=1).astype(np.float32)
+
+
+def import_humanml3d_npy(filepath, context):
+    """Load a HumanML3D .npy file and apply as animation.
+
+    Accepts either:
+      - (seq_len, 22, 3)  raw joint positions in network coords
+      - (seq_len, 263)    HumanML3D feature vectors (recover_from_ric is applied)
+    """
+    raw = np.load(filepath, allow_pickle=True)
+
+    if raw.ndim == 3 and raw.shape[1] == 22 and raw.shape[2] == 3:
+        joint_positions = raw.astype(np.float32)
+    elif raw.ndim == 2 and raw.shape[1] == 263:
+        joint_positions = _recover_from_ric_np(raw)
+    else:
+        raise ValueError(
+            f"Unrecognised HumanML3D array shape {raw.shape}. "
+            "Expected (seq_len, 22, 3) or (seq_len, 263)."
+        )
+
+    return _apply_joint_positions(joint_positions, context)
 
 
 
 class DMI_OT_Import(Operator, ImportHelper):
     bl_idname = "dmi.import_result"
     bl_label = "Import Result"
-    bl_description = "Load NPZ with joint positions and apply as animation"
+    bl_description = "Load an NPZ result or a HumanML3D .npy file and apply as animation"
     bl_options = {'REGISTER', 'UNDO'}
+
+    # Default; overridden in invoke based on import_source
+    filename_ext = ".npz"
+
+    def invoke(self, context, event):
+        props = context.scene.dmi_props
+        if props.import_source == 'HML3D':
+            self.filename_ext = ".npy"
+        else:
+            self.filename_ext = ".npz"
+        return super().invoke(context, event)
 
     def execute(self, context):
         obj = context.active_object
@@ -587,9 +682,17 @@ class DMI_OT_Import(Operator, ImportHelper):
             self.report({'ERROR'}, f"File not found: {filepath}")
             return {'CANCELLED'}
 
-        import_npz(filepath, context)
         props = context.scene.dmi_props
-        self.report({'INFO'}, f"Imported {props.frame_count} frames from {filepath}")
+        try:
+            if props.import_source == 'HML3D':
+                n_frames = import_humanml3d_npy(filepath, context)
+            else:
+                n_frames = import_npz(filepath, context)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Imported {n_frames} frames from {filepath}")
         return {'FINISHED'}
 
 
