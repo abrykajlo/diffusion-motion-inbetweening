@@ -8,7 +8,6 @@ Blender operators for the DMI addon:
 """
 
 import os
-import queue
 import subprocess
 import threading
 
@@ -322,7 +321,6 @@ class DMI_OT_RunInference(Operator):
     _proc = None
     _output_lines = []
     _return_code = None
-    _progress_queue = None   # queue.Queue of (pct: int, msg: str) tuples
 
     def _get_prefs(self, context):
         return context.preferences.addons[__package__].preferences
@@ -373,7 +371,6 @@ class DMI_OT_RunInference(Operator):
         # 3. Launch subprocess in a background thread so Blender stays responsive
         DMI_OT_RunInference._output_lines = []
         DMI_OT_RunInference._return_code = None
-        DMI_OT_RunInference._progress_queue = queue.Queue()
 
         def run():
             try:
@@ -388,17 +385,7 @@ class DMI_OT_RunInference(Operator):
                 for line in proc.stdout:
                     line = line.rstrip()
                     DMI_OT_RunInference._output_lines.append(line)
-                    if line.startswith("PROGRESS:"):
-                        parts = line.split(":", 2)
-                        if len(parts) == 3:
-                            try:
-                                pct = int(parts[1])
-                                msg = parts[2]
-                                DMI_OT_RunInference._progress_queue.put((pct, msg))
-                            except ValueError:
-                                pass
-                    else:
-                        print("[DMI inference]", line)
+                    print("[DMI inference]", line)
                 proc.wait()
                 DMI_OT_RunInference._return_code = proc.returncode
             except Exception as exc:
@@ -410,7 +397,6 @@ class DMI_OT_RunInference(Operator):
 
         # 4. Register a modal timer to poll the thread
         wm = context.window_manager
-        wm.progress_begin(0, 100)
         DMI_OT_RunInference._timer = wm.event_timer_add(0.25, window=context.window)
         wm.modal_handler_add(self)
         return {'RUNNING_MODAL'}
@@ -419,28 +405,13 @@ class DMI_OT_RunInference(Operator):
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
 
-        # Drain progress queue and update Blender's progress bar
-        wm = context.window_manager
-        q = DMI_OT_RunInference._progress_queue
-        if q is not None:
-            last_msg = None
-            while not q.empty():
-                try:
-                    pct, msg = q.get_nowait()
-                    wm.progress_update(pct)
-                    last_msg = msg
-                except queue.Empty:
-                    break
-            if last_msg is not None:
-                self.report({'INFO'}, last_msg)
-
         # Still running?
         if DMI_OT_RunInference._return_code is None:
             return {'RUNNING_MODAL'}
 
-        # Done – clean up timer and progress bar
+        # Done – clean up timer
+        wm = context.window_manager
         wm.event_timer_remove(DMI_OT_RunInference._timer)
-        wm.progress_end()
         DMI_OT_RunInference._timer = None
 
         if DMI_OT_RunInference._return_code != 0:
@@ -467,7 +438,6 @@ class DMI_OT_RunInference(Operator):
         wm = context.window_manager
         if DMI_OT_RunInference._timer:
             wm.event_timer_remove(DMI_OT_RunInference._timer)
-            wm.progress_end()
         if DMI_OT_RunInference._proc:
             DMI_OT_RunInference._proc.terminate()
 

@@ -17,15 +17,9 @@ Usage:
 import os
 import argparse
 import json
-import sys
 
 import numpy as np
 import torch
-
-
-def progress(pct: int, msg: str):
-    """Emit a structured progress line that the Blender addon can parse."""
-    print(f"PROGRESS:{pct}:{msg}", flush=True)
 
 from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion, load_saved_model
@@ -253,7 +247,7 @@ def main():
     args = parse_args()
     fixseed(args.seed)
 
-    progress(0, "Loading Blender export...")
+    print(f"Loading Blender export from: {args.blender_input}")
     blender_data = np.load(args.blender_input, allow_pickle=True)
     joint_positions = blender_data['joint_positions']     # [n_frames, 22, 3]
     constraint_mask = blender_data['constraint_mask']     # [n_frames, 22]
@@ -279,12 +273,12 @@ def main():
     device = dist_util.dev()
 
     # Load dataset for normalization stats
-    progress(5, "Loading dataset for normalization...")
+    print("Loading dataset for normalization...")
     data = load_dataset(model_args, max_frames)
     t2m_dataset = data.dataset.t2m_dataset
 
     # Interpolate positions between constrained keyframes
-    progress(15, "Interpolating positions between keyframes...")
+    print("Interpolating positions between keyframes...")
     interp_positions = interpolate_positions(
         joint_positions[:n_frames], constraint_mask[:n_frames]
     )
@@ -295,7 +289,7 @@ def main():
         print("WARNING: No constraints found. Running unconditional generation.")
 
     # Convert positions to 263 features
-    progress(20, "Converting positions to feature representation...")
+    print("Converting positions to feature representation...")
     mean_abs = torch.from_numpy(t2m_dataset.mean).float()
     std_abs = torch.from_numpy(t2m_dataset.std).float()
 
@@ -349,7 +343,7 @@ def main():
     model_kwargs['y']['diffusion_steps'] = model_args.get('diffusion_steps', 1000)
 
     # Create model and diffusion
-    progress(25, "Creating model and diffusion...")
+    print("Creating model and diffusion...")
 
     # Build a namespace-like object from model_args for create_model_and_diffusion
     class Args:
@@ -364,7 +358,7 @@ def main():
 
     model, diffusion = create_model_and_diffusion(margs, data)
 
-    progress(35, f"Loading checkpoint...")
+    print(f"Loading checkpoint from: {args.model_path}")
     load_saved_model(model, args.model_path)
 
     if args.guidance_param != 1:
@@ -376,64 +370,26 @@ def main():
     # Run sampling
     all_positions = []
 
-    # Patch tqdm so p_sample_loop's progress=True emits PROGRESS lines instead of
-    # a terminal bar that Blender can't display.
-    import tqdm as _tqdm_module
-    import tqdm.auto as _tqdm_auto_module
-
-    def _make_progress_tqdm(rep_i, num_reps):
-        # Each repetition occupies an equal slice of the 40–95% range.
-        rep_range = 55 // num_reps
-        rep_offset = 40 + rep_i * rep_range
-
-        class _ProgressTqdm:
-            def __init__(self, iterable=None, **kwargs):
-                self._items = list(iterable) if iterable is not None else []
-                self._n = len(self._items)
-
-            def __iter__(self):
-                for i, item in enumerate(self._items):
-                    pct = rep_offset + int(rep_range * i / max(self._n - 1, 1))
-                    progress(pct, f"Sampling {rep_i + 1}/{num_reps} — step {i + 1}/{self._n}")
-                    yield item
-
-            def __len__(self):
-                return self._n
-
-        return _ProgressTqdm
-
-    _orig_tqdm = _tqdm_module.tqdm
-    _orig_tqdm_auto = _tqdm_auto_module.tqdm
-
     for rep_i in range(args.num_repetitions):
-        progress(40 + rep_i * (55 // args.num_repetitions),
-                 f"Starting sampling repetition {rep_i + 1}/{args.num_repetitions}...")
-
-        _ProgressTqdm = _make_progress_tqdm(rep_i, args.num_repetitions)
-        _tqdm_module.tqdm = _ProgressTqdm
-        _tqdm_auto_module.tqdm = _ProgressTqdm
+        print(f"Sampling repetition {rep_i + 1}/{args.num_repetitions}...")
 
         if args.guidance_param != 1:
             model_kwargs['y']['text_scale'] = (
                 torch.ones(1, device=device) * args.guidance_param
             )
 
-        try:
-            sample = diffusion.p_sample_loop(
-                model,
-                (1, model.njoints, model.nfeats, max_frames),
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-                skip_timesteps=0,
-                init_image=None,
-                progress=True,
-                dump_steps=None,
-                noise=None,
-                const_noise=False,
-            )  # [1, 263, 1, max_frames]
-        finally:
-            _tqdm_module.tqdm = _orig_tqdm
-            _tqdm_auto_module.tqdm = _orig_tqdm_auto
+        sample = diffusion.p_sample_loop(
+            model,
+            (1, model.njoints, model.nfeats, max_frames),
+            clip_denoised=False,
+            model_kwargs=model_kwargs,
+            skip_timesteps=0,
+            init_image=None,
+            progress=True,
+            dump_steps=None,
+            noise=None,
+            const_noise=False,
+        )  # [1, 263, 1, max_frames]
 
         # Convert to joint positions
         positions = features_to_positions(
@@ -449,7 +405,7 @@ def main():
     all_positions = np.concatenate(all_positions, axis=0)  # [num_reps, n_frames, 22, 3]
 
     # Save output
-    progress(97, f"Saving {all_positions.shape[0]} sample(s)...")
+    print(f"Saving {all_positions.shape[0]} sample(s) to: {args.output}")
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
 
     all_positions = all_positions[:, :, :, [2, 1, 0]]
@@ -471,7 +427,7 @@ def main():
         )
         print(f"All repetitions saved to: {all_path}")
 
-    progress(100, "Done!")
+    print("Done!")
 
 
 if __name__ == "__main__":
