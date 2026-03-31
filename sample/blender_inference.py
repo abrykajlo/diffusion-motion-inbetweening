@@ -369,6 +369,7 @@ def main():
 
     # Run sampling
     all_positions = []
+
     for rep_i in range(args.num_repetitions):
         print(f"Sampling repetition {rep_i + 1}/{args.num_repetitions}...")
 
