@@ -133,6 +133,10 @@ class DMI_OT_CreateArmature(Operator):
         constraints = Constraints(context.scene)
         constraints.save()
 
+        # Clear any cached HML3D data from a previous import
+        if HML3D_CACHE_KEY in context.scene:
+            del context.scene[HML3D_CACHE_KEY]
+
         self.report({'INFO'}, "Created 22-bone SMPL armature")
         return {'FINISHED'}
 
@@ -166,8 +170,6 @@ class DMI_OT_ToggleConstraint(Operator):
             else:
                 constraints.set(frame, bone.name)
                 toggled.append(f"+{bone.name}")
-                bone.keyframe_insert(data_path="location", frame=frame)
-                bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
 
         constraints.save()
 
@@ -190,11 +192,6 @@ class DMI_OT_ConstrainAllBones(Operator):
         constraints = Constraints(context.scene)
         for name in HML_JOINT_NAMES:
             constraints.set(frame, name)
-            if obj and obj.type == 'ARMATURE':
-                bone = obj.pose.bones.get(name)
-                if bone:
-                    bone.keyframe_insert(data_path="location", frame=frame)
-                    bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
         constraints.save()
         self.report({'INFO'}, f"All bones constrained at frame {frame}")
         return {'FINISHED'}
@@ -272,13 +269,20 @@ def export_npz(filepath, context):
         os.path.dirname(filepath) if os.path.dirname(filepath) else '.',
         exist_ok=True,
     )
-    np.savez(
-        filepath,
+    save_kwargs = dict(
         joint_positions=joint_positions,
         constraint_mask=constraint_mask,
         text_prompt=props.text_prompt,
         fps=20,
     )
+
+    # Include cached HML3D network-coord positions if available
+    cache_path = context.scene.get(HML3D_CACHE_KEY, "")
+    if cache_path and os.path.exists(cache_path):
+        hml3d_positions = np.load(cache_path, allow_pickle=True)
+        save_kwargs['hml3d_joint_positions'] = hml3d_positions
+
+    np.savez(filepath, **save_kwargs)
 
 
 class DMI_OT_Export(Operator, ExportHelper):
@@ -617,12 +621,18 @@ def _recover_from_ric_np(data, joints_num=22):
     return np.concatenate([r_pos[:, np.newaxis, :], positions], axis=1).astype(np.float32)
 
 
+HML3D_CACHE_KEY = "dmi_hml3d_cache_path"
+
+
 def import_humanml3d_npy(filepath, context):
     """Load a HumanML3D .npy file and apply as animation.
 
     Accepts either:
       - (seq_len, 22, 3)  raw joint positions in network coords
       - (seq_len, 263)    HumanML3D feature vectors (recover_from_ric is applied)
+
+    Caches the original network-coord joint positions so they can be
+    re-exported for inference without Blender round-trip errors.
     """
     raw = np.load(filepath, allow_pickle=True)
 
@@ -635,6 +645,13 @@ def import_humanml3d_npy(filepath, context):
             f"Unrecognised HumanML3D array shape {raw.shape}. "
             "Expected (seq_len, 22, 3) or (seq_len, 263)."
         )
+
+    # Cache the network-coord positions for later export
+    cache_dir = os.path.join(os.path.dirname(filepath), ".dmi_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, os.path.basename(filepath))
+    np.save(cache_path, joint_positions)
+    context.scene[HML3D_CACHE_KEY] = cache_path
 
     return _apply_joint_positions(joint_positions, context)
 

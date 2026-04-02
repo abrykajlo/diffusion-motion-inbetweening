@@ -277,10 +277,17 @@ def main():
     data = load_dataset(model_args, max_frames)
     t2m_dataset = data.dataset.t2m_dataset
 
+    # Use cached HML3D positions if available (avoids Blender round-trip errors)
+    if 'hml3d_joint_positions' in blender_data:
+        print("Using cached HML3D joint positions (debug mode)")
+        hml3d_positions = blender_data['hml3d_joint_positions'][:n_frames]
+    else:
+        hml3d_positions = joint_positions[:n_frames]
+
     # Interpolate positions between constrained keyframes
     print("Interpolating positions between keyframes...")
     interp_positions = interpolate_positions(
-        joint_positions[:n_frames], constraint_mask[:n_frames]
+        hml3d_positions, constraint_mask[:n_frames]
     )
 
     # Check if any constraints exist
