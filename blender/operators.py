@@ -124,6 +124,9 @@ class DMI_OT_CreateArmature(Operator):
 
         bpy.ops.object.mode_set(mode='OBJECT')
 
+        # Pelvis location is set in armature space, not bone-local space
+        arm_data.bones['pelvis'].use_local_location = False
+
         context.scene.render.fps = 20
         context.scene.render.fps_base = 1.0
 
