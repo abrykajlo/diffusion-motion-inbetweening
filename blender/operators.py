@@ -544,7 +544,20 @@ def import_npz(filepath, context):
     """Load joint positions from a DMI NPZ file and apply as animation."""
     data = np.load(filepath, allow_pickle=True)
     joint_positions = data['joint_positions']  # [n_frames, 22, 3] network coords
-    return _apply_joint_positions(joint_positions, context)
+    n_frames = _apply_joint_positions(joint_positions, context)
+
+    if 'constraint_mask' in data:
+        constraint_mask = data['constraint_mask']  # [n_frames, 22] bool
+        constraints = Constraints(context.scene)
+        constraints.clear()
+        for fi in range(constraint_mask.shape[0]):
+            frame = fi + 1
+            for ji in range(constraint_mask.shape[1]):
+                if constraint_mask[fi, ji]:
+                    constraints.set(frame, HML_JOINT_NAMES[ji])
+        constraints.save()
+
+    return n_frames
 
 
 # ---------------------------------------------------------------------------
