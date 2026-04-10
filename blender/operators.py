@@ -349,8 +349,18 @@ class DMI_OT_RunInference(Operator):
         inferences_dir = os.path.join(bpy.path.abspath(prefs.project_path), "blender_inferences")
         os.makedirs(inferences_dir, exist_ok=True)
         name = props.inference_name or "inference"
-        export_path = os.path.join(inferences_dir, f"{name}_export.npz")
-        import_path = os.path.join(inferences_dir, f"{name}_result.npz")
+
+        # Create a unique sub-folder for this inference run
+        run_dir = os.path.join(inferences_dir, name)
+        if os.path.exists(run_dir):
+            n = 1
+            while os.path.exists(os.path.join(inferences_dir, f"{name}_{n}")):
+                n += 1
+            run_dir = os.path.join(inferences_dir, f"{name}_{n}")
+        os.makedirs(run_dir)
+
+        export_path = os.path.join(run_dir, "export.npz")
+        import_path = os.path.join(run_dir, "result.npz")
 
         # 1. Run export first
         try:
@@ -376,6 +386,7 @@ class DMI_OT_RunInference(Operator):
         self.report({'INFO'}, f"Starting inference subprocess…")
 
         # 3. Launch subprocess in a background thread so Blender stays responsive
+        DMI_OT_RunInference._import_path = import_path
         DMI_OT_RunInference._output_lines = []
         DMI_OT_RunInference._return_code = None
 
@@ -427,12 +438,7 @@ class DMI_OT_RunInference(Operator):
             return {'CANCELLED'}
 
         # 5. Auto-import result
-        prefs = self._get_prefs(context)
-        props = context.scene.dmi_props
-        name = props.inference_name or "inference"
-        import_path = os.path.join(
-            bpy.path.abspath(prefs.project_path), "blender_inferences", f"{name}_result.npz"
-        )
+        import_path = DMI_OT_RunInference._import_path
         try:
             import_npz(import_path, context)
             self.report({'INFO'}, "Inference complete and result imported.")
