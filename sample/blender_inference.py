@@ -37,6 +37,7 @@ from data_loaders.humanml.utils.paramUtil import (
     t2m_kinematic_chain,
 )
 from data_loaders.humanml.common.skeleton import Skeleton
+from data_loaders.humanml.common.quaternion import qbetween_np, qrot_np, qinv_np
 from data_loaders.tensors import collate
 from utils.editing_util import joint_to_full_mask
 
@@ -127,13 +128,18 @@ def interpolate_positions(joint_positions, constraint_mask):
 def positions_to_features(joint_positions, mean_abs, std_abs):
     """
     Convert [n_frames, 22, 3] joint positions to normalized 263-feature representation.
-    Follows the pipeline in dataset.py:motion_to_abs_data().
+    Follows the full pipeline in motion_process.py:process_file() so that the
+    features match the training data distribution.
 
-    Returns: torch tensor [1, 263, 1, n_frames]
+    Returns:
+        sample_abs: torch tensor [1, 263, 1, n_frames]
+        root_quat_init: [4] numpy quaternion used to pre-rotate to face +Z
+        root_pos_init_xz: [3] numpy offset subtracted to center root at XZ origin
     """
     n_raw_offsets = torch.from_numpy(t2m_raw_offsets)
     kinematic_chain = t2m_kinematic_chain
     face_joint_indx = [2, 1, 17, 16]
+    r_hip, l_hip, sdr_r, sdr_l = face_joint_indx
     fid_r, fid_l = [8, 11], [7, 10]
 
     # Normalize skeleton proportions to reference skeleton
@@ -148,6 +154,29 @@ def positions_to_features(joint_positions, mean_abs, std_abs):
     # Put on floor
     floor_height = positions.min(axis=0).min(axis=0)[1]
     positions[:, :, 1] -= floor_height
+
+    # --- Replicate process_file() preprocessing ---
+    # Center root XZ at origin
+    root_pos_init = positions[0]
+    root_pos_init_xz = root_pos_init[0] * np.array([1, 0, 1])
+    positions = positions - root_pos_init_xz
+
+    # Rotate all positions so the character initially faces +Z.
+    # Training data is always pre-rotated this way; without it the absolute
+    # position features end up in the wrong coordinate frame and the model
+    # generates motion along the wrong axis.
+    across1 = root_pos_init[r_hip] - root_pos_init[l_hip]
+    across2 = root_pos_init[sdr_r] - root_pos_init[sdr_l]
+    across = across1 + across2
+    across = across / np.sqrt((across ** 2).sum(axis=-1))[..., np.newaxis]
+    forward_init = np.cross(np.array([[0, 1, 0]]), across, axis=-1)
+    forward_init = forward_init / np.sqrt((forward_init ** 2).sum(axis=-1))[..., np.newaxis]
+
+    target = np.array([[0, 0, 1]])
+    root_quat_init = qbetween_np(forward_init, target)
+    # Broadcast to all frames and joints
+    root_quat_init_exp = np.ones(positions.shape[:-1] + (4,)) * root_quat_init
+    positions = qrot_np(root_quat_init_exp, positions)
 
     # extract_features returns [n_frames-1, 263] (relative representation)
     sample_rel = extract_features(
@@ -177,7 +206,7 @@ def positions_to_features(joint_positions, mean_abs, std_abs):
     sample_abs = sample_abs.squeeze(0)  # [1, n_frames, 263]
     sample_abs = sample_abs.permute(0, 2, 1).unsqueeze(2)  # [1, 263, 1, n_frames]
 
-    return sample_abs
+    return sample_abs, root_quat_init.flatten(), root_pos_init_xz
 
 
 def create_obs_mask(constraint_mask, max_frames, feature_mode='pos_rot_vel'):
@@ -185,6 +214,16 @@ def create_obs_mask(constraint_mask, max_frames, feature_mode='pos_rot_vel'):
     Convert [n_frames, 22] bool constraint mask to [1, 263, 1, max_frames] feature mask.
     """
     n_frames = constraint_mask.shape[0]
+
+    # Ensure the root joint is constrained at every frame where any joint is
+    # constrained. Non-root joint positions are stored as root-invariant (RIC)
+    # features. If the root rotation/position is not also constrained the
+    # diffusion model is free to change it, causing the RIC positions to be
+    # interpreted with the wrong root transform and placing joints on the
+    # wrong axis.
+    constraint_mask = constraint_mask.copy()
+    any_constrained = constraint_mask.any(axis=1)  # [n_frames]
+    constraint_mask[any_constrained, 0] = True
 
     # Build joint mask [1, 22, 1, max_frames]
     joint_mask = torch.zeros(1, 22, 1, max_frames, dtype=torch.bool)
@@ -198,9 +237,14 @@ def create_obs_mask(constraint_mask, max_frames, feature_mode='pos_rot_vel'):
     return feature_mask
 
 
-def features_to_positions(sample, inv_transform_fn, abs_3d=True):
+def features_to_positions(sample, inv_transform_fn, abs_3d=True,
+                          root_quat_init=None, root_pos_init_xz=None):
     """
     Convert model output [bs, 263, 1, n_frames] to joint positions [bs, n_frames, 22, 3].
+
+    If root_quat_init / root_pos_init_xz are provided the inverse of the
+    pre-rotation applied by positions_to_features is undone so the output
+    positions are back in the original world frame.
     """
     # [bs, 263, 1, n_frames] -> [bs, 1, n_frames, 263]
     sample = sample.cpu().permute(0, 2, 3, 1)
@@ -212,7 +256,19 @@ def features_to_positions(sample, inv_transform_fn, abs_3d=True):
     positions = recover_from_ric(sample, joints_num=22, abs_3d=abs_3d)
     # positions shape: [bs, 1, n_frames, 22, 3]
 
-    return positions.squeeze(1).numpy()  # [bs, n_frames, 22, 3]
+    positions = positions.squeeze(1).numpy()  # [bs, n_frames, 22, 3]
+
+    # Undo the pre-rotation that was applied to match training data
+    if root_quat_init is not None:
+        inv_quat = qinv_np(root_quat_init[np.newaxis])  # [1, 4]
+        for i in range(positions.shape[0]):
+            inv_quat_exp = np.ones(positions[i].shape[:-1] + (4,)) * inv_quat
+            positions[i] = qrot_np(inv_quat_exp, positions[i])
+
+    if root_pos_init_xz is not None:
+        positions = positions + root_pos_init_xz
+
+    return positions
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +337,11 @@ def main():
     if 'hml3d_joint_positions' in blender_data:
         print("Using cached HML3D joint positions (debug mode)")
         hml3d_positions = blender_data['hml3d_joint_positions'][:n_frames]
+        # Override cached positions at constrained frames/joints with the
+        # Blender-exported positions.  The user may have moved keyframes to
+        # new locations that the cache doesn't reflect.
+        mask = constraint_mask[:n_frames]
+        hml3d_positions[mask] = joint_positions[:n_frames][mask]
     else:
         hml3d_positions = joint_positions[:n_frames]
 
@@ -300,7 +361,9 @@ def main():
     mean_abs = torch.from_numpy(t2m_dataset.mean).float()
     std_abs = torch.from_numpy(t2m_dataset.std).float()
 
-    obs_x0 = positions_to_features(interp_positions, mean_abs, std_abs)
+    obs_x0, root_quat_init, root_pos_init_xz = positions_to_features(
+        interp_positions, mean_abs, std_abs
+    )
     # Pad to max_frames if needed
     if obs_x0.shape[-1] < max_frames:
         padding = torch.zeros(1, 263, 1, max_frames - obs_x0.shape[-1])
@@ -403,6 +466,8 @@ def main():
             sample,
             inv_transform_fn=t2m_dataset.inv_transform,
             abs_3d=model_args.get('abs_3d', True),
+            root_quat_init=root_quat_init,
+            root_pos_init_xz=root_pos_init_xz,
         )  # [1, n_frames, 22, 3] -- but full max_frames
 
         # Trim to actual motion length
