@@ -151,6 +151,7 @@ class DMI_Properties(PropertyGroup):
         items=[
             ('NPZ', "DMI NPZ", "NPZ file exported and processed by the DMI addon"),
             ('HML3D', "HumanML3D", "Raw .npy file from the HumanML3D dataset (joint positions or 263-dim features)"),
+            ('INFERENCE', "Inference Run", "Load an inference run folder (export.npz + result.npz)"),
         ],
         default='NPZ',
     )

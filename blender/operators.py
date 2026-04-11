@@ -663,10 +663,62 @@ def import_humanml3d_npy(filepath, context):
 
 
 
+def import_inference_run(run_dir, context):
+    """Load an inference run folder containing export.npz and result.npz.
+
+    Imports the export (constrained keyframes + constraints) and the result
+    (inferred keyframes), restoring both keyframe layers.
+    """
+    export_path = os.path.join(run_dir, "export.npz")
+    result_path = os.path.join(run_dir, "result.npz")
+
+    if not os.path.exists(export_path):
+        raise FileNotFoundError(f"export.npz not found in {run_dir}")
+    if not os.path.exists(result_path):
+        raise FileNotFoundError(f"result.npz not found in {run_dir}")
+
+    props = context.scene.dmi_props
+    obj = context.active_object
+
+    # --- Load the export (constrained pose + constraints) ---
+    export_data = np.load(export_path, allow_pickle=True)
+    export_positions = export_data['joint_positions']
+    _apply_joint_positions(export_positions, context)
+
+    if 'constraint_mask' in export_data:
+        constraint_mask = export_data['constraint_mask']
+        constraints = Constraints(context.scene)
+        constraints.clear()
+        for fi in range(constraint_mask.shape[0]):
+            frame = fi + 1
+            for ji in range(constraint_mask.shape[1]):
+                if constraint_mask[fi, ji]:
+                    constraints.set(frame, HML_JOINT_NAMES[ji])
+        constraints.save()
+
+    if 'text_prompt' in export_data:
+        props.text_prompt = str(export_data['text_prompt'])
+
+    # Cache the network-coord positions for re-export
+    if 'hml3d_joint_positions' in export_data:
+        cache_dir = os.path.join(run_dir, ".dmi_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, "hml3d_positions.npy")
+        np.save(cache_path, export_data['hml3d_joint_positions'])
+        context.scene[HML3D_CACHE_KEY] = cache_path
+
+    # --- Load the result (inferred animation) ---
+    result_data = np.load(result_path, allow_pickle=True)
+    result_positions = result_data['joint_positions']
+    n_frames = _apply_joint_positions(result_positions, context)
+
+    return n_frames
+
+
 class DMI_OT_Import(Operator, ImportHelper):
     bl_idname = "dmi.import_result"
     bl_label = "Import Result"
-    bl_description = "Load an NPZ result or a HumanML3D .npy file and apply as animation"
+    bl_description = "Load an NPZ result, a HumanML3D .npy file, or an inference run folder"
     bl_options = {'REGISTER', 'UNDO'}
 
     # Default; overridden in invoke based on import_source
@@ -678,6 +730,27 @@ class DMI_OT_Import(Operator, ImportHelper):
             self.filename_ext = ".npy"
         else:
             self.filename_ext = ".npz"
+
+        prefs = context.preferences.addons[__package__].preferences
+        if props.import_source == 'INFERENCE':
+            inferences_dir = os.path.join(
+                bpy.path.abspath(prefs.project_path), "blender_inferences"
+            )
+            if os.path.isdir(inferences_dir):
+                self.filepath = inferences_dir + os.sep
+        elif props.import_source == 'HML3D':
+            hml3d_dir = os.path.join(
+                bpy.path.abspath(prefs.project_path), "dataset", "HumanML3D"
+            )
+            if os.path.isdir(hml3d_dir):
+                self.filepath = hml3d_dir + os.sep
+        else:
+            inferences_dir = os.path.join(
+                bpy.path.abspath(prefs.project_path), "blender_inferences"
+            )
+            if os.path.isdir(inferences_dir):
+                self.filepath = inferences_dir + os.sep
+
         return super().invoke(context, event)
 
     def execute(self, context):
@@ -687,21 +760,34 @@ class DMI_OT_Import(Operator, ImportHelper):
             return {'CANCELLED'}
 
         filepath = bpy.path.abspath(self.filepath)
-        if not os.path.exists(filepath):
-            self.report({'ERROR'}, f"File not found: {filepath}")
-            return {'CANCELLED'}
-
         props = context.scene.dmi_props
+
         try:
-            if props.import_source == 'HML3D':
+            if props.import_source == 'INFERENCE':
+                # User may select either file in the folder or the folder itself;
+                # resolve to the containing directory.
+                if os.path.isfile(filepath):
+                    run_dir = os.path.dirname(filepath)
+                else:
+                    run_dir = filepath
+                n_frames = import_inference_run(run_dir, context)
+                self.report({'INFO'}, f"Imported inference run ({n_frames} frames) from {run_dir}")
+            elif props.import_source == 'HML3D':
+                if not os.path.exists(filepath):
+                    self.report({'ERROR'}, f"File not found: {filepath}")
+                    return {'CANCELLED'}
                 n_frames = import_humanml3d_npy(filepath, context)
+                self.report({'INFO'}, f"Imported {n_frames} frames from {filepath}")
             else:
+                if not os.path.exists(filepath):
+                    self.report({'ERROR'}, f"File not found: {filepath}")
+                    return {'CANCELLED'}
                 n_frames = import_npz(filepath, context)
+                self.report({'INFO'}, f"Imported {n_frames} frames from {filepath}")
         except Exception as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Imported {n_frames} frames from {filepath}")
         return {'FINISHED'}
 
 
