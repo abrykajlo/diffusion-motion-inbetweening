@@ -387,6 +387,7 @@ class DMI_OT_RunInference(Operator):
 
         # 3. Launch subprocess in a background thread so Blender stays responsive
         DMI_OT_RunInference._import_path = import_path
+        props.last_inference_dir = run_dir
         DMI_OT_RunInference._output_lines = []
         DMI_OT_RunInference._return_code = None
 
@@ -712,6 +713,8 @@ def import_inference_run(run_dir, context):
     result_positions = result_data['joint_positions']
     n_frames = _apply_joint_positions(result_positions, context)
 
+    props.last_inference_dir = run_dir
+
     return n_frames
 
 
@@ -857,6 +860,31 @@ class DMI_OT_SnapshotConstraintKeyframes(Operator):
 
 
 # ---------------------------------------------------------------------------
+# Export CSV
+# ---------------------------------------------------------------------------
+
+class DMI_OT_ExportCSV(Operator):
+    bl_idname = "dmi.export_csv"
+    bl_label = "Export CSV Data"
+    bl_description = "Export inference data as CSV"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props = context.scene.dmi_props
+        inference_path = props.last_inference_dir
+        if not inference_path:
+            self.report({'ERROR'}, "No inference run available")
+            return {'CANCELLED'}
+
+        data_dir = os.path.join(inference_path, "data")
+        os.makedirs(data_dir, exist_ok=True)
+
+        print(f"Exporting CSV Data for {inference_path}")
+        self.report({'INFO'}, f"Exporting CSV Data for {inference_path}")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Public list of all operator classes
 # ---------------------------------------------------------------------------
 
@@ -870,4 +898,5 @@ classes = (
     DMI_OT_Import,
     DMI_OT_ApplyKeyframeLayer,
     DMI_OT_SnapshotConstraintKeyframes,
+    DMI_OT_ExportCSV,
 )

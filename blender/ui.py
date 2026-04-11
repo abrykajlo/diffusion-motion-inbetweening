@@ -145,6 +145,11 @@ class DMI_Properties(PropertyGroup):
     )
     keyframes_constrained: StringProperty(default='{}')
     keyframes_inferred: StringProperty(default='{}')
+    last_inference_dir: StringProperty(
+        name="Last Inference Directory",
+        description="Path to the most recent inference run folder",
+        default="",
+    )
     import_source: EnumProperty(
         name="Source",
         description="File format to import",
@@ -228,6 +233,13 @@ class DMI_PT_Panel(Panel):
         box.label(text="Import", icon='IMPORT')
         box.prop(props, "import_source")
         box.operator("dmi.import_result", icon='FILE_REFRESH')
+
+        # --- Export CSV ---
+        box = layout.box()
+        box.label(text="CSV Export", icon='FILE_TEXT')
+        row = box.row()
+        row.enabled = bool(props.last_inference_dir)
+        row.operator("dmi.export_csv", icon='FILE_TICK')
 
         # --- Keyframe Layers ---
         box = layout.box()
