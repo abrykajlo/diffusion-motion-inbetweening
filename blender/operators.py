@@ -8,8 +8,10 @@ Blender operators for the DMI addon:
 """
 
 import os
+import re
 import subprocess
 import threading
+import time
 
 import bpy
 import numpy as np
@@ -390,6 +392,7 @@ class DMI_OT_RunInference(Operator):
         props.last_inference_dir = run_dir
         DMI_OT_RunInference._output_lines = []
         DMI_OT_RunInference._return_code = None
+        DMI_OT_RunInference._start_time = time.monotonic()
 
         def run():
             try:
@@ -432,6 +435,18 @@ class DMI_OT_RunInference(Operator):
         wm = context.window_manager
         wm.event_timer_remove(DMI_OT_RunInference._timer)
         DMI_OT_RunInference._timer = None
+
+        elapsed = time.monotonic() - DMI_OT_RunInference._start_time
+
+        # Log inference time to the cumulative CSV at the inferences root
+        import_path = DMI_OT_RunInference._import_path
+        run_dir = os.path.dirname(import_path)
+        inferences_dir = os.path.dirname(run_dir)
+        try:
+            from .evaluation_export import export_inference_time
+            export_inference_time(os.path.basename(run_dir), inferences_dir, elapsed, context)
+        except Exception as exc:
+            print(f"[DMI] Failed to log inference time: {exc}")
 
         if DMI_OT_RunInference._return_code != 0:
             last_lines = "\n".join(DMI_OT_RunInference._output_lines[-5:])
@@ -714,6 +729,7 @@ def import_inference_run(run_dir, context):
     n_frames = _apply_joint_positions(result_positions, context)
 
     props.last_inference_dir = run_dir
+    props.inference_name = re.sub(r"_\d+$", "", os.path.basename(os.path.normpath(run_dir)))
 
     return n_frames
 
@@ -866,10 +882,17 @@ class DMI_OT_SnapshotConstraintKeyframes(Operator):
 class DMI_OT_ExportCSV(Operator):
     bl_idname = "dmi.export_csv"
     bl_label = "Export CSV Data"
-    bl_description = "Export inference data as CSV"
+    bl_description = "Export all evaluation CSVs (joint positions, keyframe error, foot skating, inference time)"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
+        from .evaluation_export import export_all_evaluation_data
+
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the DMI armature first")
+            return {'CANCELLED'}
+
         props = context.scene.dmi_props
         inference_path = props.last_inference_dir
         if not inference_path:
@@ -879,8 +902,13 @@ class DMI_OT_ExportCSV(Operator):
         data_dir = os.path.join(inference_path, "data")
         os.makedirs(data_dir, exist_ok=True)
 
-        print(f"Exporting CSV Data for {inference_path}")
-        self.report({'INFO'}, f"Exporting CSV Data for {inference_path}")
+        try:
+            paths = export_all_evaluation_data(data_dir, context)
+        except Exception as exc:
+            self.report({'ERROR'}, f"CSV export failed: {exc}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Exported {len(paths)} CSV file(s) to {data_dir}")
         return {'FINISHED'}
 
 

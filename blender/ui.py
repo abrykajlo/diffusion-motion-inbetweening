@@ -236,7 +236,7 @@ class DMI_PT_Panel(Panel):
 
         # --- Export CSV ---
         box = layout.box()
-        box.label(text="CSV Export", icon='FILE_TEXT')
+        box.label(text="Evaluation CSV Export", icon='FILE_TEXT')
         row = box.row()
         row.enabled = bool(props.last_inference_dir)
         row.operator("dmi.export_csv", icon='FILE_TICK')
