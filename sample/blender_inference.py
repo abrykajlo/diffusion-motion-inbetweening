@@ -64,6 +64,10 @@ def parse_args():
                         help="Number of motion samples to generate")
     parser.add_argument("--text_prompt", type=str, default=None,
                         help="Override text prompt from the NPZ file")
+    parser.add_argument("--dump_steps", type=int, nargs='*', default=None,
+                        help="Dump intermediate diffusion steps. "
+                             "Pass specific step indices (e.g. --dump_steps 0 100 500 999) "
+                             "or pass no values to dump ~20 evenly spaced steps plus the final.")
     return parser.parse_args()
 
 
@@ -437,6 +441,18 @@ def main():
     model.to(device)
     model.eval()
 
+    # Resolve dump_steps: if flag was passed with no values, generate ~20 evenly spaced
+    dump_steps = args.dump_steps
+    num_diffusion_steps = model_args.get('diffusion_steps', 1000)
+    if dump_steps is not None and len(dump_steps) == 0:
+        # Generate ~20 evenly spaced steps including 0 and the last step
+        n_dump = 20
+        dump_steps = sorted(set(
+            [int(round(i * (num_diffusion_steps - 1) / (n_dump - 1)))
+             for i in range(n_dump)]
+        ))
+        print(f"Auto-generated dump_steps: {dump_steps}")
+
     # Run sampling
     all_positions = []
 
@@ -456,23 +472,39 @@ def main():
             skip_timesteps=0,
             init_image=None,
             progress=True,
-            dump_steps=None,
+            dump_steps=dump_steps,
             noise=None,
             const_noise=False,
-        )  # [1, 263, 1, max_frames]
+        )
 
-        # Convert to joint positions
-        positions = features_to_positions(
-            sample,
-            inv_transform_fn=t2m_dataset.inv_transform,
-            abs_3d=model_args.get('abs_3d', True),
-            root_quat_init=root_quat_init,
-            root_pos_init_xz=root_pos_init_xz,
-        )  # [1, n_frames, 22, 3] -- but full max_frames
+        if dump_steps is not None:
+            # sample is a list of pred_xstart tensors, one per dump step
+            # Convert each to joint positions
+            step_positions_list = []
+            for step_idx, step_sample in zip(dump_steps, sample):
+                positions = features_to_positions(
+                    step_sample,
+                    inv_transform_fn=t2m_dataset.inv_transform,
+                    abs_3d=model_args.get('abs_3d', True),
+                    root_quat_init=root_quat_init,
+                    root_pos_init_xz=root_pos_init_xz,
+                )
+                positions = positions[:, :n_frames, :, :]
+                step_positions_list.append(positions[0])  # [n_frames, 22, 3]
 
-        # Trim to actual motion length
-        positions = positions[:, :n_frames, :, :]
-        all_positions.append(positions)
+            # Use the last dump step as the final result
+            all_positions.append(step_positions_list[-1][np.newaxis])
+        else:
+            # sample is [1, 263, 1, max_frames]
+            positions = features_to_positions(
+                sample,
+                inv_transform_fn=t2m_dataset.inv_transform,
+                abs_3d=model_args.get('abs_3d', True),
+                root_quat_init=root_quat_init,
+                root_pos_init_xz=root_pos_init_xz,
+            )  # [1, n_frames, 22, 3] -- but full max_frames
+            positions = positions[:, :n_frames, :, :]
+            all_positions.append(positions)
 
     all_positions = np.concatenate(all_positions, axis=0)  # [num_reps, n_frames, 22, 3]
 
@@ -480,12 +512,20 @@ def main():
     print(f"Saving {all_positions.shape[0]} sample(s) to: {args.output}")
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
 
-    # Save the first repetition as the primary result (for Blender import)
+    # Save the primary result
     np.savez(
         args.output,
         joint_positions=all_positions[0],  # [n_frames, 22, 3]
         fps=20,
     )
+
+    # Save each intermediate diffusion step as its own file
+    if dump_steps is not None:
+        output_dir = os.path.dirname(args.output) or '.'
+        for step_idx, step_pos in zip(dump_steps, step_positions_list):
+            step_path = os.path.join(output_dir, f"dump_step_{step_idx}.npz")
+            np.savez(step_path, joint_positions=step_pos, fps=20)
+        print(f"Saved {len(dump_steps)} step files to {output_dir}")
 
     # If multiple repetitions, save all
     if args.num_repetitions > 1:

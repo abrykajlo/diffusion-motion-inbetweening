@@ -384,6 +384,8 @@ class DMI_OT_RunInference(Operator):
             "--num_repetitions", str(props.num_repetitions),
             "--seed", str(props.seed),
         ]
+        if props.dump_diffusion_steps:
+            cmd.append("--dump_steps")
 
         self.report({'INFO'}, f"Starting inference subprocess…")
 
@@ -457,6 +459,8 @@ class DMI_OT_RunInference(Operator):
         import_path = DMI_OT_RunInference._import_path
         try:
             import_npz(import_path, context)
+            # Reset step index so navigator shows "Result" until user browses
+            context.scene.dmi_props.diffusion_step_index = -1
             self.report({'INFO'}, "Inference complete and result imported.")
         except Exception as exc:
             self.report({'WARNING'}, f"Inference complete but import failed: {exc}")
@@ -730,6 +734,7 @@ def import_inference_run(run_dir, context):
 
     props.last_inference_dir = run_dir
     props.inference_name = re.sub(r"_\d+$", "", os.path.basename(os.path.normpath(run_dir)))
+    props.diffusion_step_index = -1
 
     return n_frames
 
@@ -876,6 +881,93 @@ class DMI_OT_SnapshotConstraintKeyframes(Operator):
 
 
 # ---------------------------------------------------------------------------
+# Diffusion step browser
+# ---------------------------------------------------------------------------
+
+class DMI_OT_BrowseDiffusionStep(Operator):
+    bl_idname = "dmi.browse_diffusion_step"
+    bl_label = "Browse Diffusion Step"
+    bl_description = "Navigate to the previous or next dumped diffusion step"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: bpy.props.EnumProperty(
+        items=[
+            ('PREV', "Previous", "Go to earlier diffusion step (noisier)"),
+            ('NEXT', "Next",     "Go to later diffusion step (cleaner)"),
+        ],
+        name="Direction",
+    )
+
+    def execute(self, context):
+        from .ui import get_dump_steps
+
+        props = context.scene.dmi_props
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the DMI armature first")
+            return {'CANCELLED'}
+
+        dump_steps = get_dump_steps(props.last_inference_dir)
+        if not dump_steps:
+            self.report({'WARNING'}, "No dump step files found")
+            return {'CANCELLED'}
+
+        n = len(dump_steps)
+        idx = props.diffusion_step_index
+
+        if self.direction == 'PREV':
+            idx = max(0, idx - 1) if idx >= 0 else n - 1
+        else:
+            idx = min(n - 1, idx + 1) if idx >= 0 else 0
+
+        if idx == props.diffusion_step_index:
+            return {'FINISHED'}
+
+        props.diffusion_step_index = idx
+
+        t, filepath = dump_steps[idx]
+        try:
+            data = np.load(filepath, allow_pickle=True)
+            _apply_joint_positions(data['joint_positions'], context)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to load {filepath}: {exc}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Diffusion step {idx + 1}/{n} (t={t})")
+        return {'FINISHED'}
+
+
+class DMI_OT_BrowseDiffusionStepResult(Operator):
+    bl_idname = "dmi.browse_diffusion_step_result"
+    bl_label = "Back to Result"
+    bl_description = "Return to the final inference result"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.dmi_props
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the DMI armature first")
+            return {'CANCELLED'}
+
+        result_path = os.path.join(props.last_inference_dir, "result.npz")
+        if not os.path.exists(result_path):
+            self.report({'ERROR'}, "result.npz not found in inference directory")
+            return {'CANCELLED'}
+
+        try:
+            data = np.load(result_path, allow_pickle=True)
+            _apply_joint_positions(data['joint_positions'], context)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to load result: {exc}")
+            return {'CANCELLED'}
+
+        props.diffusion_step_index = -1
+        self.report({'INFO'}, "Restored final inference result")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
 # Export CSV
 # ---------------------------------------------------------------------------
 
@@ -926,5 +1018,7 @@ classes = (
     DMI_OT_Import,
     DMI_OT_ApplyKeyframeLayer,
     DMI_OT_SnapshotConstraintKeyframes,
+    DMI_OT_BrowseDiffusionStep,
+    DMI_OT_BrowseDiffusionStepResult,
     DMI_OT_ExportCSV,
 )

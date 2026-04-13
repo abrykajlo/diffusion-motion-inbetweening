@@ -14,6 +14,37 @@ from .constraints import Constraints
 
 
 # ---------------------------------------------------------------------------
+# Cached dump-step file list (avoids os.listdir on every panel redraw)
+# ---------------------------------------------------------------------------
+
+_dump_steps_cache = {}   # inference_dir -> sorted list of (timestep_int, filepath)
+_dump_steps_mtime = {}   # inference_dir -> last scan time
+
+
+def get_dump_steps(inference_dir):
+    """Return sorted list of (timestep, filepath) for dump_step_*.npz in inference_dir.
+
+    Cached per directory; rescans at most once per second.
+    """
+    import time, re, os
+    if not inference_dir or not os.path.isdir(inference_dir):
+        return []
+    now = time.monotonic()
+    if inference_dir in _dump_steps_cache and now - _dump_steps_mtime.get(inference_dir, 0) < 1.0:
+        return _dump_steps_cache[inference_dir]
+    pattern = re.compile(r'^dump_step_(\d+)\.npz$')
+    steps = []
+    for name in os.listdir(inference_dir):
+        m = pattern.match(name)
+        if m:
+            steps.append((int(m.group(1)), os.path.join(inference_dir, name)))
+    steps.sort(key=lambda x: x[0])
+    _dump_steps_cache[inference_dir] = steps
+    _dump_steps_mtime[inference_dir] = now
+    return steps
+
+
+# ---------------------------------------------------------------------------
 # Preferences dotfile persistence
 # ---------------------------------------------------------------------------
 
@@ -145,6 +176,17 @@ class DMI_Properties(PropertyGroup):
     )
     keyframes_constrained: StringProperty(default='{}')
     keyframes_inferred: StringProperty(default='{}')
+    dump_diffusion_steps: BoolProperty(
+        name="Dump Steps",
+        description="Save intermediate diffusion step predictions for debugging",
+        default=False,
+    )
+    diffusion_step_index: IntProperty(
+        name="Step",
+        description="Index into the sorted list of dump step files currently being viewed",
+        default=-1,
+        min=-1,
+    )
     last_inference_dir: StringProperty(
         name="Last Inference Directory",
         description="Path to the most recent inference run folder",
@@ -218,6 +260,7 @@ class DMI_PT_Panel(Panel):
         box.prop(props, "guidance_param")
         box.prop(props, "num_repetitions")
         box.prop(props, "seed")
+        box.prop(props, "dump_diffusion_steps")
         op_row = box.row(align=True)
         op_row.operator("dmi.run_inference", text="Run Inference", icon='SHADERFX')
         
@@ -268,5 +311,30 @@ class DMI_PT_Panel(Panel):
             depress=(props.active_keyframe_layer == 'INFERRED'),
         )
         op.layer = 'INFERRED'
+
+        # --- Diffusion step navigator ---
+        dump_steps = get_dump_steps(props.last_inference_dir)
+        if dump_steps:
+            step_box = box.box()
+            step_box.label(text="Diffusion Steps", icon='SEQUENCE')
+            row = step_box.row(align=True)
+            prev_op = row.operator("dmi.browse_diffusion_step", text="", icon='TRIA_LEFT')
+            prev_op.direction = 'PREV'
+
+            idx = props.diffusion_step_index
+            n = len(dump_steps)
+            if 0 <= idx < n:
+                t = dump_steps[idx][0]
+                step_label = f"Step {idx + 1} / {n}  (t={t})"
+            else:
+                step_label = f"Result  ({n} steps available)"
+            row.label(text=step_label)
+
+            next_op = row.operator("dmi.browse_diffusion_step", text="", icon='TRIA_RIGHT')
+            next_op.direction = 'NEXT'
+
+            # Button to jump back to the final result
+            if 0 <= idx < n:
+                step_box.operator("dmi.browse_diffusion_step_result", text="Back to Result", icon='LOOP_BACK')
 
         box.operator("dmi.snapshot_constraint_keyframes", text="Snapshot as Constrained", icon='PINNED')
