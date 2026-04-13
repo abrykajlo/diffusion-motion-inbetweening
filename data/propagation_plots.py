@@ -8,9 +8,15 @@ Expects an input folder containing:
     perturbed_<test_id>.csv            — columns: frame, joint_name, x, y, z
 
 Usage:
-    python propagation_plots.py <input_dir> [--outdir DIR]
+    python propagation_plots.py <run_name> [--outdir DIR]
+    python propagation_plots.py --dir <input_dir> [--outdir DIR]
 
-Produces (in outdir, default = <input_dir>/plots):
+When called with a run name, the script looks in
+``blender_inferences/`` for a matching inference run folder (exact name
+first, then the highest-numbered ``<name>_N`` variant) and uses its
+``data/`` subdirectory as the input folder.
+
+Produces (in outdir, default = <run_dir>/images):
     propagation_<test_id>.png          — per-test per-frame mean joint distance
     propagation_aggregate.png          — all tests overlaid by relative frame,
                                          with the average decay curve
@@ -22,6 +28,8 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from resolve_run import resolve_run_dir
 
 
 def load_pair(input_dir, test_id):
@@ -95,14 +103,30 @@ def plot_aggregate(all_series, out_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('input_dir', help='Folder with baseline/perturbed CSVs and metadata.csv')
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('run_name', nargs='?', default=None,
+                        help='Inference run name to look up in blender_inferences/')
+    parser.add_argument('--dir', default=None, dest='input_dir',
+                        help='Explicit folder with baseline/perturbed CSVs and metadata.csv')
     parser.add_argument('--outdir', default=None,
-                        help='Output directory for PNG files (defaults to <input_dir>/plots)')
+                        help='Output directory for PNG files (defaults to <run_dir>/images)')
     args = parser.parse_args()
 
-    input_dir = args.input_dir
-    outdir = args.outdir or os.path.join(input_dir, 'plots')
+    if args.input_dir:
+        input_dir = args.input_dir
+        default_outdir = os.path.join(input_dir, 'plots')
+    elif args.run_name:
+        input_dir = os.path.join(resolve_run_dir(args.run_name), 'data')
+        print(f'Resolved: {input_dir}')
+        run_dir = os.path.dirname(input_dir)
+        default_outdir = os.path.join(run_dir, 'images')
+    else:
+        parser.error('provide a run name or --dir path')
+
+    outdir = args.outdir or default_outdir
     os.makedirs(outdir, exist_ok=True)
 
     meta_path = os.path.join(input_dir, 'metadata.csv')

@@ -2,7 +2,13 @@
 Plot per-joint keyframe error from a `keyframe_error.csv` export.
 
 Usage:
-    python keyframe_error_plots.py <path/to/keyframe_error.csv> [--outdir DIR]
+    python keyframe_error_plots.py <run_name> [--outdir DIR]
+    python keyframe_error_plots.py --csv <path/to/keyframe_error.csv> [--outdir DIR]
+
+When called with a run name, the script looks in
+``blender_inferences/`` for a matching inference run folder (exact name
+first, then the highest-numbered ``<name>_N`` variant) and reads
+``data/keyframe_error.csv`` from it.
 
 Produces:
     keyframe_error_per_joint.png   — bar chart of mean error per joint
@@ -15,6 +21,8 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from resolve_run import resolve_run_file
 
 
 def compute_keyframe_error(csv_path):
@@ -60,16 +68,34 @@ def plot_error_vs_frame(df, out_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('csv_path', help='Path to keyframe_error.csv')
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('run_name', nargs='?', default=None,
+                        help='Inference run name to look up in blender_inferences/')
+    parser.add_argument('--csv', default=None, dest='csv_path',
+                        help='Explicit path to keyframe_error.csv (bypasses run name lookup)')
     parser.add_argument('--outdir', default=None,
                         help='Output directory for PNG files (defaults to CSV directory)')
     args = parser.parse_args()
 
-    outdir = args.outdir or os.path.dirname(os.path.abspath(args.csv_path))
+    if args.csv_path:
+        csv_path = args.csv_path
+        default_outdir = os.path.dirname(os.path.abspath(csv_path))
+    elif args.run_name:
+        csv_path = resolve_run_file(args.run_name, 'data/keyframe_error.csv')
+        print(f'Resolved: {csv_path}')
+        # csv lives at <run_dir>/data/keyframe_error.csv — output to <run_dir>/images
+        run_dir = os.path.dirname(os.path.dirname(os.path.abspath(csv_path)))
+        default_outdir = os.path.join(run_dir, 'images')
+    else:
+        parser.error('provide a run name or --csv path')
+
+    outdir = args.outdir or default_outdir
     os.makedirs(outdir, exist_ok=True)
 
-    df = compute_keyframe_error(args.csv_path)
+    df = compute_keyframe_error(csv_path)
     if df.empty:
         print('No keyframed rows found; nothing to plot.')
         return

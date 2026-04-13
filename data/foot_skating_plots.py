@@ -2,7 +2,13 @@
 Plot foot skating from a `foot_skating.csv` export.
 
 Usage:
-    python foot_skating_plots.py <path/to/foot_skating.csv> [--outdir DIR] [--threshold 0.01]
+    python foot_skating_plots.py <run_name> [--outdir DIR] [--threshold 0.01]
+    python foot_skating_plots.py --csv <path/to/foot_skating.csv> [--outdir DIR]
+
+When called with a run name, the script looks in
+``blender_inferences/`` for a matching inference run folder (exact name
+first, then the highest-numbered ``<name>_N`` variant) and reads
+``data/foot_skating.csv`` from it.
 
 Computes per-frame displacement between consecutive frames for each foot.
 The foot skating ratio is the proportion of grounded frames where the
@@ -19,6 +25,8 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from resolve_run import resolve_run_file
 
 
 def compute_displacements(df):
@@ -90,18 +98,35 @@ def plot_skating_ratio(left_ratio, right_ratio, out_path, threshold):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('csv_path', help='Path to foot_skating.csv')
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('run_name', nargs='?', default=None,
+                        help='Inference run name to look up in blender_inferences/')
+    parser.add_argument('--csv', default=None, dest='csv_path',
+                        help='Explicit path to foot_skating.csv (bypasses run name lookup)')
     parser.add_argument('--outdir', default=None,
-                        help='Output directory for PNG files (defaults to CSV directory)')
+                        help='Output directory for PNG files (defaults to <run_dir>/images)')
     parser.add_argument('--threshold', type=float, default=0.01,
                         help='Displacement threshold (m) above which a grounded frame counts as skating')
     args = parser.parse_args()
 
-    outdir = args.outdir or os.path.dirname(os.path.abspath(args.csv_path))
+    if args.csv_path:
+        csv_path = args.csv_path
+        default_outdir = os.path.dirname(os.path.abspath(csv_path))
+    elif args.run_name:
+        csv_path = resolve_run_file(args.run_name, 'data/foot_skating.csv')
+        print(f'Resolved: {csv_path}')
+        run_dir = os.path.dirname(os.path.dirname(os.path.abspath(csv_path)))
+        default_outdir = os.path.join(run_dir, 'images')
+    else:
+        parser.error('provide a run name or --csv path')
+
+    outdir = args.outdir or default_outdir
     os.makedirs(outdir, exist_ok=True)
 
-    df = pd.read_csv(args.csv_path)
+    df = pd.read_csv(csv_path)
     df = compute_displacements(df)
 
     left_ratio, left_slip, left_total = skating_ratio(df, 'left', args.threshold)

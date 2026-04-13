@@ -87,8 +87,15 @@ def plot_correlation_heatmap(df, out_path):
 
 
 def main():
+    default_csv = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'blender_inferences', 'inference_time_log.csv',
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('csv_path', help='Path to inference_time_log.csv')
+    parser.add_argument('csv_path', nargs='?', default=default_csv,
+                        help='Path to inference_time_log.csv '
+                             '(default: blender_inferences/inference_time_log.csv)')
     parser.add_argument('--outdir', default=None,
                         help='Output directory for PNG files (defaults to CSV directory)')
     args = parser.parse_args()
