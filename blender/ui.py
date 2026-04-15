@@ -263,7 +263,20 @@ class DMI_PT_Panel(Panel):
         box.prop(props, "dump_diffusion_steps")
         op_row = box.row(align=True)
         op_row.operator("dmi.run_inference", text="Run Inference", icon='SHADERFX')
-        
+
+        # Show progress while inference is running
+        from .operators import DMI_OT_RunInference
+        if DMI_OT_RunInference._timer is not None:
+            total = DMI_OT_RunInference._progress_total
+            current = DMI_OT_RunInference._progress_current
+            if total > 0:
+                pct = int(100 * current / total)
+                filled = pct // 5
+                bar = "\u2588" * filled + "\u2591" * (20 - filled)
+                box.label(text=f"{bar}  {current} / {total}")
+            else:
+                box.label(text="Starting inference...", icon='TIME')
+
         # --- Export ---
         box = layout.box()
         box.label(text="Export", icon='EXPORT')

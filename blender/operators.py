@@ -330,6 +330,8 @@ class DMI_OT_RunInference(Operator):
     _proc = None
     _output_lines = []
     _return_code = None
+    _progress_current = 0
+    _progress_total = 0
 
     def _get_prefs(self, context):
         return context.preferences.addons[__package__].preferences
@@ -395,21 +397,42 @@ class DMI_OT_RunInference(Operator):
         DMI_OT_RunInference._output_lines = []
         DMI_OT_RunInference._return_code = None
         DMI_OT_RunInference._start_time = time.monotonic()
+        DMI_OT_RunInference._progress_current = 0
+        DMI_OT_RunInference._progress_total = 0
+
+        _progress_re = re.compile(r'(\d+)/(\d+)')
 
         def run():
             try:
+                env = os.environ.copy()
+                env['PYTHONUNBUFFERED'] = '1'
                 proc = subprocess.Popen(
                     cmd,
                     cwd=prefs.project_path,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    env=env,
                 )
                 DMI_OT_RunInference._proc = proc
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    DMI_OT_RunInference._output_lines.append(line)
-                    print("[DMI inference]", line)
+                # Read character-by-character to capture tqdm \r updates
+                buf = ''
+                for ch in iter(lambda: proc.stdout.read(1), ''):
+                    if ch in ('\n', '\r'):
+                        line = buf.strip()
+                        if line:
+                            DMI_OT_RunInference._output_lines.append(line)
+                            print("[DMI inference]", line)
+                            m = _progress_re.search(line)
+                            if m:
+                                DMI_OT_RunInference._progress_current = int(m.group(1))
+                                DMI_OT_RunInference._progress_total = int(m.group(2))
+                        buf = ''
+                    else:
+                        buf += ch
+                if buf.strip():
+                    DMI_OT_RunInference._output_lines.append(buf.strip())
+                    print("[DMI inference]", buf.strip())
                 proc.wait()
                 DMI_OT_RunInference._return_code = proc.returncode
             except Exception as exc:
@@ -431,6 +454,10 @@ class DMI_OT_RunInference(Operator):
 
         # Still running?
         if DMI_OT_RunInference._return_code is None:
+            # Redraw the sidebar so the progress bar updates
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         # Done – clean up timer
