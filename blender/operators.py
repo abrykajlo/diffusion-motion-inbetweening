@@ -382,9 +382,9 @@ class DMI_OT_RunInference(Operator):
             "--blender_input", export_path,
             "--output", import_path,
             "--text_prompt", props.text_prompt,
-            "--guidance_param", str(props.guidance_param),
-            "--num_repetitions", str(props.num_repetitions),
-            "--seed", str(props.seed),
+            "--guidance_param", "2.5",
+            "--num_repetitions", "1",
+            "--seed", "10",
         ]
         if props.dump_diffusion_steps:
             cmd.append("--dump_steps")
@@ -887,26 +887,6 @@ class DMI_OT_ApplyKeyframeLayer(Operator):
         return {'FINISHED'}
 
 
-class DMI_OT_SnapshotConstraintKeyframes(Operator):
-    bl_idname = "dmi.snapshot_constraint_keyframes"
-    bl_label = "Snapshot as Constrained"
-    bl_description = "Save the armature's current keyframes as the constrained layer"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        import json
-
-        obj = context.active_object
-        if not obj or obj.type != 'ARMATURE':
-            self.report({'ERROR'}, "Select the DMI armature first")
-            return {'CANCELLED'}
-
-        context.scene.dmi_props.keyframes_constrained = json.dumps(_snapshot_keyframes(obj))
-        context.scene.dmi_props.active_keyframe_layer = 'CONSTRAINED'
-        self.report({'INFO'}, "Constrained keyframes snapshot saved")
-        return {'FINISHED'}
-
-
 # ---------------------------------------------------------------------------
 # Diffusion step browser
 # ---------------------------------------------------------------------------
@@ -1044,7 +1024,6 @@ classes = (
     DMI_OT_RunInference,
     DMI_OT_Import,
     DMI_OT_ApplyKeyframeLayer,
-    DMI_OT_SnapshotConstraintKeyframes,
     DMI_OT_BrowseDiffusionStep,
     DMI_OT_BrowseDiffusionStepResult,
     DMI_OT_ExportCSV,

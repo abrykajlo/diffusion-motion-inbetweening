@@ -138,25 +138,6 @@ class DMI_Properties(PropertyGroup):
         min=10,
         max=196,
     )
-    guidance_param: FloatProperty(
-        name="Guidance Scale",
-        description="Classifier-free guidance scale for inference",
-        default=2.5,
-        min=1.0,
-        max=10.0,
-    )
-    num_repetitions: IntProperty(
-        name="Repetitions",
-        description="Number of motion samples to generate",
-        default=1,
-        min=1,
-        max=10,
-    )
-    seed: IntProperty(
-        name="Seed",
-        description="Random seed for reproducibility",
-        default=10,
-    )
     inference_name: StringProperty(
         name="Name",
         description="Name used for export/result NPZ files (saved to <project>/blender_inferences/)",
@@ -257,9 +238,6 @@ class DMI_PT_Panel(Panel):
         box = layout.box()
         box.label(text="Inference", icon='PLAY')
         box.prop(props, "inference_name")
-        box.prop(props, "guidance_param")
-        box.prop(props, "num_repetitions")
-        box.prop(props, "seed")
         box.prop(props, "dump_diffusion_steps")
         op_row = box.row(align=True)
         op_row.operator("dmi.run_inference", text="Run Inference", icon='SHADERFX')
@@ -349,5 +327,3 @@ class DMI_PT_Panel(Panel):
             # Button to jump back to the final result
             if 0 <= idx < n:
                 step_box.operator("dmi.browse_diffusion_step_result", text="Back to Result", icon='LOOP_BACK')
-
-        box.operator("dmi.snapshot_constraint_keyframes", text="Snapshot as Constrained", icon='PINNED')
