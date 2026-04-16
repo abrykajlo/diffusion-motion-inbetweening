@@ -35,8 +35,7 @@ def compute_displacements(df):
     for side in ('left', 'right'):
         dx = df[f'{side}_foot_x'].diff()
         dy = df[f'{side}_foot_y'].diff()
-        dz = df[f'{side}_foot_z'].diff()
-        df[f'{side}_disp'] = np.sqrt(dx * dx + dy * dy + dz * dz)
+        df[f'{side}_disp'] = np.sqrt(dx * dx + dy * dy)
 
     return df
 

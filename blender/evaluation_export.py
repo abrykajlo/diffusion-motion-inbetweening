@@ -22,8 +22,16 @@ from .constraints import Constraints
 FLOAT_PRECISION = 6
 INFERENCE_LOG_FILE = "inference_time_log.csv"
 PROPAGATION_METADATA_FILE = "propagation_metadata.csv"
-FOOT_GROUNDED_KEY = "dmi_foot_grounded"
 PROPAGATION_META_KEY = "dmi_propagation_meta"
+
+# Foot-grounded detection thresholds (Blender world-space meters, z-up).
+# A foot counts as grounded on frame N when its height above the inferred
+# floor is below GROUND_HEIGHT_THRESHOLD *and* its vertical speed between
+# frames N-1 and N is below GROUND_VSPEED_THRESHOLD. The floor is inferred
+# as the minimum observed foot z across the animation, which assumes the
+# character touches the ground at least once.
+GROUND_HEIGHT_THRESHOLD = 0.05
+GROUND_VSPEED_THRESHOLD = 0.025
 
 
 # ---------------------------------------------------------------------------
@@ -90,14 +98,6 @@ def _append_csv(path, header, row):
         if write_header:
             writer.writerow(header)
         writer.writerow(row)
-
-
-def _load_foot_grounded(scene):
-    raw = scene.get(FOOT_GROUNDED_KEY, "{}")
-    try:
-        return json.loads(raw) if isinstance(raw, str) else {}
-    except json.JSONDecodeError:
-        return {}
 
 
 def _load_propagation_meta(scene):
@@ -212,24 +212,42 @@ def _build_keyframe_error_rows(generated_samples, keyframe_lookup, constraints):
 # 3. Foot skating
 # ---------------------------------------------------------------------------
 
+def _compute_foot_grounded(foot_positions):
+    """Per-frame grounded flags (0/1) for a single foot given its z-up positions."""
+    if not foot_positions:
+        return []
+    zs = [p[2] for p in foot_positions]
+    floor = min(zs)
+    flags = []
+    prev_z = None
+    for z in zs:
+        low = (z - floor) < GROUND_HEIGHT_THRESHOLD
+        slow = prev_z is None or abs(z - prev_z) < GROUND_VSPEED_THRESHOLD
+        flags.append(int(low and slow))
+        prev_z = z
+    return flags
+
+
 def export_foot_skating_data(output_dir, context=None):
     context = context or bpy.context
     samples = _sample_world_positions(context)
-    grounded = _load_foot_grounded(context.scene)
+
+    valid = [(fi, per_bone['left_foot'], per_bone['right_foot'])
+             for fi, _, per_bone in samples
+             if per_bone.get('left_foot') is not None
+             and per_bone.get('right_foot') is not None]
+
+    left_grounded = _compute_foot_grounded([v[1] for v in valid])
+    right_grounded = _compute_foot_grounded([v[2] for v in valid])
 
     rows = []
-    for fi, blender_frame, per_bone in samples:
-        lf = per_bone.get('left_foot')
-        rf = per_bone.get('right_foot')
-        if lf is None or rf is None:
-            continue
-        flags = grounded.get(str(blender_frame), {})
+    for (fi, lf, rf), lg, rg in zip(valid, left_grounded, right_grounded):
         rows.append([
             fi,
             _round(lf[0]), _round(lf[1]), _round(lf[2]),
             _round(rf[0]), _round(rf[1]), _round(rf[2]),
-            int(bool(flags.get('left', 0))),
-            int(bool(flags.get('right', 0))),
+            lg,
+            rg,
         ])
 
     path = os.path.join(output_dir, "foot_skating.csv")
