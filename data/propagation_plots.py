@@ -1,101 +1,111 @@
 """
-Plot constraint-propagation decay curves from paired baseline/perturbed runs.
-
-Expects an input folder containing:
-    metadata.csv                       — columns: test_id, perturbed_frame,
-                                         perturbation_magnitude, perturbed_joint
-    baseline_<test_id>.csv             — columns: frame, joint_name, x, y, z
-    perturbed_<test_id>.csv            — columns: frame, joint_name, x, y, z
+Plot a constraint-propagation decay curve from two inference runs.
 
 Usage:
-    python propagation_plots.py <run_name> [--outdir DIR]
-    python propagation_plots.py --dir <input_dir> [--outdir DIR]
+    python propagation_plots.py <baseline_run> <perturbed_run> [--outdir DIR]
 
-When called with a run name, the script looks in
-``blender_inferences/`` for a matching inference run folder (exact name
-first, then the highest-numbered ``<name>_N`` variant) and uses its
-``data/`` subdirectory as the input folder.
+Looks in ``blender_inferences/`` for each run folder (exact name first, then
+the highest-numbered ``<name>_N`` variant). For each run we read:
 
-Produces (in outdir, default = <run_dir>/images):
-    propagation_<test_id>.png          — per-test per-frame mean joint distance
-    propagation_aggregate.png          — all tests overlaid by relative frame,
-                                         with the average decay curve
+    <run>/result.npz     — generated joint_positions [n_frames, 22, 3]
+    <run>/export.npz     — Blender-side export with constraint_mask and
+                           constrained joint_positions [n_frames, 22, 3]
+
+Per-frame mean joint distance between the two runs' generated motions is
+plotted as the decay curve. The perturbed (frame, joint) is detected by
+comparing the two ``export.npz`` files at every location constrained in
+either run and picking the one with the largest position delta.
+
+Produces (in outdir, default = <perturbed_run_dir>/images):
+    propagation_<baseline>_vs_<perturbed>.png
 """
 
 import argparse
 import os
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 
 from resolve_run import resolve_run_dir
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from data_loaders.humanml_utils import HML_JOINT_NAMES  # noqa: E402
 
-def load_pair(input_dir, test_id):
-    base_path = os.path.join(input_dir, f'baseline_{test_id}.csv')
-    pert_path = os.path.join(input_dir, f'perturbed_{test_id}.csv')
-    if not os.path.exists(base_path) or not os.path.exists(pert_path):
+
+def load_result_positions(run_dir):
+    path = os.path.join(run_dir, 'result.npz')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'result.npz not found at {path}')
+    return np.load(path)['joint_positions']
+
+
+def mean_distance_per_frame(baseline_pos, perturbed_pos):
+    """[n_frames, 22, 3] pair → (frames, mean_distance_per_frame)."""
+    if baseline_pos.shape[1:] != perturbed_pos.shape[1:]:
+        raise ValueError(
+            f'joint/coord shape mismatch: baseline {baseline_pos.shape} '
+            f'vs perturbed {perturbed_pos.shape}'
+        )
+    n = min(baseline_pos.shape[0], perturbed_pos.shape[0])
+    if baseline_pos.shape[0] != perturbed_pos.shape[0]:
+        print(f'[warn] frame count differs ({baseline_pos.shape[0]} vs '
+              f'{perturbed_pos.shape[0]}); truncating to {n}')
+    per_joint = np.linalg.norm(baseline_pos[:n] - perturbed_pos[:n], axis=-1)
+    return np.arange(n), per_joint.mean(axis=-1)
+
+
+def detect_perturbation(baseline_run_dir, perturbed_run_dir):
+    """Find the constrained location whose position differs most between the two runs.
+
+    Returns (frame_index, joint_name, magnitude) or None if no difference.
+    """
+    base = np.load(os.path.join(baseline_run_dir, 'export.npz'))
+    pert = np.load(os.path.join(perturbed_run_dir, 'export.npz'))
+
+    b_pos = base['joint_positions']
+    p_pos = pert['joint_positions']
+    b_mask = base['constraint_mask']
+    p_mask = pert['constraint_mask']
+
+    if b_pos.shape != p_pos.shape:
+        raise ValueError(
+            f'export.npz joint_positions shape mismatch: '
+            f'baseline {b_pos.shape} vs perturbed {p_pos.shape}'
+        )
+
+    either_mask = b_mask | p_mask
+    delta = np.linalg.norm(b_pos - p_pos, axis=-1)
+    delta = np.where(either_mask, delta, 0.0)
+
+    if not np.any(delta > 0):
         return None
-    return pd.read_csv(base_path), pd.read_csv(pert_path)
+
+    fi, ji = np.unravel_index(int(np.argmax(delta)), delta.shape)
+    magnitude = float(delta[fi, ji])
+    joint_name = HML_JOINT_NAMES[ji] if ji < len(HML_JOINT_NAMES) else f'joint_{ji}'
+    return int(fi), joint_name, magnitude
 
 
-def mean_distance_per_frame(baseline, perturbed):
-    merged = baseline.merge(
-        perturbed, on=['frame', 'joint_name'], suffixes=('_b', '_p')
-    )
-    dx = merged['x_b'] - merged['x_p']
-    dy = merged['y_b'] - merged['y_p']
-    dz = merged['z_b'] - merged['z_p']
-    merged['dist'] = np.sqrt(dx * dx + dy * dy + dz * dz)
-    return merged.groupby('frame', as_index=False)['dist'].mean().sort_values('frame')
-
-
-def plot_single_test(series, meta_row, out_path):
+def plot_propagation(frames, distances, base_name, pert_name, detection, out_path):
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(series['frame'], series['dist'], color='steelblue', linewidth=1.5,
+    ax.plot(frames, distances, color='steelblue', linewidth=1.5,
             label='mean joint distance')
 
-    perturbed_frame = int(meta_row['perturbed_frame'])
-    ax.axvline(perturbed_frame, color='red', linestyle='--', linewidth=1.2,
-               label=f'perturbed frame = {perturbed_frame}')
+    title_bits = [f'{base_name} vs {pert_name}']
+    if detection is not None:
+        frame, joint, magnitude = detection
+        ax.axvline(frame, color='red', linestyle='--', linewidth=1.2,
+                   label=f'perturbed frame = {frame}')
+        title_bits.append(f'joint = {joint}')
+        title_bits.append(f'magnitude = {magnitude:.4f}')
 
-    title_bits = [f"test_id = {meta_row['test_id']}"]
-    if 'perturbed_joint' in meta_row and pd.notna(meta_row['perturbed_joint']):
-        title_bits.append(f"joint = {meta_row['perturbed_joint']}")
-    if 'perturbation_magnitude' in meta_row and pd.notna(meta_row['perturbation_magnitude']):
-        title_bits.append(f"magnitude = {float(meta_row['perturbation_magnitude']):.4f}")
     ax.set_title('  |  '.join(title_bits))
     ax.set_xlabel('Frame')
     ax.set_ylabel('Mean joint distance (m)')
     ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_aggregate(all_series, out_path):
-    fig, ax = plt.subplots(figsize=(11, 6))
-
-    combined = []
-    for test_id, rel_series in all_series:
-        ax.plot(rel_series['rel_frame'], rel_series['dist'],
-                alpha=0.35, linewidth=1.0, label=test_id)
-        combined.append(rel_series)
-
-    if combined:
-        stacked = pd.concat(combined, ignore_index=True)
-        mean_curve = stacked.groupby('rel_frame', as_index=False)['dist'].mean()
-        mean_curve = mean_curve.sort_values('rel_frame')
-        ax.plot(mean_curve['rel_frame'], mean_curve['dist'],
-                color='black', linewidth=2.5, label='mean across tests')
-
-    ax.axvline(0, color='red', linestyle='--', linewidth=1.2, label='perturbed frame')
-    ax.set_xlabel('Frames from perturbed frame')
-    ax.set_ylabel('Mean joint distance (m)')
-    ax.set_title('Propagation decay curves (aligned on perturbed frame)')
-    ax.legend(loc='upper right', fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -107,67 +117,39 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('run_name', nargs='?', default=None,
-                        help='Inference run name to look up in blender_inferences/')
-    parser.add_argument('--dir', default=None, dest='input_dir',
-                        help='Explicit folder with baseline/perturbed CSVs and metadata.csv')
+    parser.add_argument('baseline_run', help='Baseline inference run name')
+    parser.add_argument('perturbed_run', help='Perturbed inference run name')
     parser.add_argument('--outdir', default=None,
-                        help='Output directory for PNG files (defaults to <run_dir>/images)')
+                        help='Output directory (defaults to <perturbed_run_dir>/images)')
     args = parser.parse_args()
 
-    if args.input_dir:
-        input_dir = args.input_dir
-        default_outdir = os.path.join(input_dir, 'plots')
-    elif args.run_name:
-        input_dir = os.path.join(resolve_run_dir(args.run_name), 'data')
-        print(f'Resolved: {input_dir}')
-        run_dir = os.path.dirname(input_dir)
-        default_outdir = os.path.join(run_dir, 'images')
-    else:
-        parser.error('provide a run name or --dir path')
+    base_dir = resolve_run_dir(args.baseline_run)
+    pert_dir = resolve_run_dir(args.perturbed_run)
+    print(f'Baseline:  {base_dir}')
+    print(f'Perturbed: {pert_dir}')
 
-    outdir = args.outdir or default_outdir
+    outdir = args.outdir or os.path.join(pert_dir, 'images')
     os.makedirs(outdir, exist_ok=True)
 
-    meta_path = os.path.join(input_dir, 'metadata.csv')
-    if not os.path.exists(meta_path):
-        raise FileNotFoundError(f'metadata.csv not found in {input_dir}')
+    baseline_pos = load_result_positions(base_dir)
+    perturbed_pos = load_result_positions(pert_dir)
 
-    meta = pd.read_csv(meta_path)
-    required = {'test_id', 'perturbed_frame'}
-    missing = required - set(meta.columns)
-    if missing:
-        raise ValueError(f'metadata.csv missing columns: {missing}')
+    frames, distances = mean_distance_per_frame(baseline_pos, perturbed_pos)
+    if len(frames) == 0:
+        raise RuntimeError('result.npz files have zero frames')
 
-    aggregate_series = []
-
-    for _, row in meta.iterrows():
-        test_id = str(row['test_id'])
-        pair = load_pair(input_dir, test_id)
-        if pair is None:
-            print(f'[skip] missing CSV pair for test_id={test_id}')
-            continue
-        baseline, perturbed = pair
-
-        series = mean_distance_per_frame(baseline, perturbed)
-        if series.empty:
-            print(f'[skip] no shared (frame, joint) rows for test_id={test_id}')
-            continue
-
-        single_path = os.path.join(outdir, f'propagation_{test_id}.png')
-        plot_single_test(series, row, single_path)
-        print(f'Wrote {single_path}')
-
-        rel = series.copy()
-        rel['rel_frame'] = rel['frame'] - int(row['perturbed_frame'])
-        aggregate_series.append((test_id, rel[['rel_frame', 'dist']]))
-
-    if aggregate_series:
-        agg_path = os.path.join(outdir, 'propagation_aggregate.png')
-        plot_aggregate(aggregate_series, agg_path)
-        print(f'Wrote {agg_path}')
+    detection = detect_perturbation(base_dir, pert_dir)
+    if detection is None:
+        print('[warn] no constrained-position difference found between export.npz files')
     else:
-        print('No test cases plotted; aggregate skipped.')
+        frame, joint, mag = detection
+        print(f'Detected perturbation: frame={frame}, joint={joint}, magnitude={mag:.4f}')
+
+    base_name = os.path.basename(base_dir)
+    pert_name = os.path.basename(pert_dir)
+    out_path = os.path.join(outdir, f'propagation_{base_name}_vs_{pert_name}.png')
+    plot_propagation(frames, distances, base_name, pert_name, detection, out_path)
+    print(f'Wrote {out_path}')
 
 
 if __name__ == '__main__':
