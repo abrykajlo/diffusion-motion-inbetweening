@@ -330,6 +330,8 @@ class DMI_OT_RunInference(Operator):
     _proc = None
     _output_lines = []
     _return_code = None
+    _progress_current = 0
+    _progress_total = 0
 
     def _get_prefs(self, context):
         return context.preferences.addons[__package__].preferences
@@ -380,9 +382,9 @@ class DMI_OT_RunInference(Operator):
             "--blender_input", export_path,
             "--output", import_path,
             "--text_prompt", props.text_prompt,
-            "--guidance_param", str(props.guidance_param),
-            "--num_repetitions", str(props.num_repetitions),
-            "--seed", str(props.seed),
+            "--guidance_param", "2.5",
+            "--num_repetitions", "1",
+            "--seed", "10",
         ]
         if props.dump_diffusion_steps:
             cmd.append("--dump_steps")
@@ -395,21 +397,42 @@ class DMI_OT_RunInference(Operator):
         DMI_OT_RunInference._output_lines = []
         DMI_OT_RunInference._return_code = None
         DMI_OT_RunInference._start_time = time.monotonic()
+        DMI_OT_RunInference._progress_current = 0
+        DMI_OT_RunInference._progress_total = 0
+
+        _progress_re = re.compile(r'(\d+)/(\d+)')
 
         def run():
             try:
+                env = os.environ.copy()
+                env['PYTHONUNBUFFERED'] = '1'
                 proc = subprocess.Popen(
                     cmd,
                     cwd=prefs.project_path,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    env=env,
                 )
                 DMI_OT_RunInference._proc = proc
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    DMI_OT_RunInference._output_lines.append(line)
-                    print("[DMI inference]", line)
+                # Read character-by-character to capture tqdm \r updates
+                buf = ''
+                for ch in iter(lambda: proc.stdout.read(1), ''):
+                    if ch in ('\n', '\r'):
+                        line = buf.strip()
+                        if line:
+                            DMI_OT_RunInference._output_lines.append(line)
+                            print("[DMI inference]", line)
+                            m = _progress_re.search(line)
+                            if m:
+                                DMI_OT_RunInference._progress_current = int(m.group(1))
+                                DMI_OT_RunInference._progress_total = int(m.group(2))
+                        buf = ''
+                    else:
+                        buf += ch
+                if buf.strip():
+                    DMI_OT_RunInference._output_lines.append(buf.strip())
+                    print("[DMI inference]", buf.strip())
                 proc.wait()
                 DMI_OT_RunInference._return_code = proc.returncode
             except Exception as exc:
@@ -431,6 +454,10 @@ class DMI_OT_RunInference(Operator):
 
         # Still running?
         if DMI_OT_RunInference._return_code is None:
+            # Redraw the sidebar so the progress bar updates
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         # Done – clean up timer
@@ -860,26 +887,6 @@ class DMI_OT_ApplyKeyframeLayer(Operator):
         return {'FINISHED'}
 
 
-class DMI_OT_SnapshotConstraintKeyframes(Operator):
-    bl_idname = "dmi.snapshot_constraint_keyframes"
-    bl_label = "Snapshot as Constrained"
-    bl_description = "Save the armature's current keyframes as the constrained layer"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        import json
-
-        obj = context.active_object
-        if not obj or obj.type != 'ARMATURE':
-            self.report({'ERROR'}, "Select the DMI armature first")
-            return {'CANCELLED'}
-
-        context.scene.dmi_props.keyframes_constrained = json.dumps(_snapshot_keyframes(obj))
-        context.scene.dmi_props.active_keyframe_layer = 'CONSTRAINED'
-        self.report({'INFO'}, "Constrained keyframes snapshot saved")
-        return {'FINISHED'}
-
-
 # ---------------------------------------------------------------------------
 # Diffusion step browser
 # ---------------------------------------------------------------------------
@@ -1017,7 +1024,6 @@ classes = (
     DMI_OT_RunInference,
     DMI_OT_Import,
     DMI_OT_ApplyKeyframeLayer,
-    DMI_OT_SnapshotConstraintKeyframes,
     DMI_OT_BrowseDiffusionStep,
     DMI_OT_BrowseDiffusionStepResult,
     DMI_OT_ExportCSV,
