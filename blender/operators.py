@@ -52,6 +52,35 @@ def _snapshot_keyframes(obj):
     return data
 
 
+def _filter_keyframes_to_mask(snapshot_json, constraint_mask):
+    """Return a keyframe snapshot containing only (frame, joint) positions
+    where *constraint_mask* (shape [n_frames, n_joints]) is True.
+
+    The input is either a JSON string or the already-parsed dict produced by
+    ``_snapshot_keyframes``. Output is JSON-encoded to match the scene-prop
+    storage format.
+    """
+    import json as _json
+    snapshot = _json.loads(snapshot_json) if isinstance(snapshot_json, str) else snapshot_json
+    n_frames, _ = constraint_mask.shape
+    filtered = {}
+    for ji, name in enumerate(HML_JOINT_NAMES):
+        bone_data = snapshot.get(name)
+        if not bone_data:
+            continue
+        kept = {}
+        for dp, triples in bone_data.items():
+            kept_triples = [
+                [f, ch, v] for f, ch, v in triples
+                if 1 <= f <= n_frames and bool(constraint_mask[f - 1, ji])
+            ]
+            if kept_triples:
+                kept[dp] = kept_triples
+        if kept:
+            filtered[name] = kept
+    return _json.dumps(filtered)
+
+
 def _apply_keyframes(obj, data):
     """Replace all DMI bone keyframes on obj with the given snapshot."""
     import json as _json
@@ -758,6 +787,13 @@ def import_inference_run(run_dir, context):
     result_data = np.load(result_path, allow_pickle=True)
     result_positions = result_data['joint_positions']
     n_frames = _apply_joint_positions(result_positions, context)
+
+    # Sparsify the constrained layer: keep only keyframes at (frame, joint)
+    # positions that were actually constrained per the export's constraint_mask.
+    if 'constraint_mask' in export_data:
+        props.keyframes_constrained = _filter_keyframes_to_mask(
+            props.keyframes_constrained, export_data['constraint_mask']
+        )
 
     props.last_inference_dir = run_dir
     props.inference_name = re.sub(r"_\d+$", "", os.path.basename(os.path.normpath(run_dir)))
