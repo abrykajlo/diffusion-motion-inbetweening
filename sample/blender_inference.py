@@ -25,7 +25,6 @@ from utils.fixseed import fixseed
 from utils.model_util import create_model_and_diffusion, load_saved_model
 from utils import dist_util
 from model.cfg_sampler import ClassifierFreeSampleModel
-from data_loaders.get_data import get_dataset_loader, DatasetConfig
 from data_loaders.humanml.scripts.motion_process import (
     extract_features,
     recover_from_ric,
@@ -276,27 +275,32 @@ def features_to_positions(sample, inv_transform_fn, abs_3d=True,
 
 
 # ---------------------------------------------------------------------------
-# Dataset loading (minimal, for normalization stats)
+# Normalization stats (loaded directly, without instantiating the dataset)
 # ---------------------------------------------------------------------------
 
-def load_dataset(model_args, max_frames):
-    """Load dataset to get normalization statistics."""
-    conf = DatasetConfig(
-        name=model_args.get('dataset', 'humanml'),
-        batch_size=1,
-        num_frames=max_frames,
-        split='test',
-        hml_mode='train',
-        use_abs3d=model_args.get('abs_3d', True),
-        traject_only=model_args.get('traj_only', False),
-        use_random_projection=model_args.get('use_random_proj', False),
-        random_projection_scale=model_args.get('random_proj_scale', None),
-        augment_type='none',
-        std_scale_shift=tuple(model_args.get('std_scale_shift', (1.0, 0.0))),
-        drop_redundant=model_args.get('drop_redundant', False),
-    )
-    data = get_dataset_loader(conf, shuffle=False, num_workers=0, drop_last=False)
-    return data
+def load_norm_stats(model_args):
+    """Load Mean/Std numpy files matching the dataset the model was trained on.
+
+    Returns (mean, std) as numpy arrays with std_scale_shift already applied
+    so `x * std + mean` matches Text2MotionDatasetV2.inv_transform.
+    """
+    assert not model_args.get('use_random_proj', False), \
+        'Random projection not supported in the direct-stats path'
+    data_root = os.path.join('dataset', 'HumanML3D_abs')
+    mean = np.load(os.path.join(data_root, 'Mean_abs_3d.npy'))
+    std = np.load(os.path.join(data_root, 'Std_abs_3d.npy'))
+    scale, shift = tuple(model_args.get('std_scale_shift', (1.0, 0.0)))
+    std = std * scale + shift
+    return mean, std
+
+
+class _StubDataLoader:
+    """Minimal stand-in for a DataLoader that satisfies create_model_and_diffusion."""
+    class _Dataset:
+        pass
+
+    def __init__(self):
+        self.dataset = self._Dataset()
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +336,12 @@ def main():
     dist_util.setup_dist(args.device)
     device = dist_util.dev()
 
-    # Load dataset for normalization stats
-    print("Loading dataset for normalization...")
-    data = load_dataset(model_args, max_frames)
-    t2m_dataset = data.dataset.t2m_dataset
+    # Load normalization stats directly from dataset/HumanML3D
+    print("Loading normalization stats...")
+    mean_np, std_np = load_norm_stats(model_args)
+
+    def inv_transform(x):
+        return x * torch.from_numpy(std_np).float() + torch.from_numpy(mean_np).float()
 
     # Use cached HML3D positions if available (avoids Blender round-trip errors)
     if 'hml3d_joint_positions' in blender_data:
@@ -362,8 +368,8 @@ def main():
 
     # Convert positions to 263 features
     print("Converting positions to feature representation...")
-    mean_abs = torch.from_numpy(t2m_dataset.mean).float()
-    std_abs = torch.from_numpy(t2m_dataset.std).float()
+    mean_abs = torch.from_numpy(mean_np).float()
+    std_abs = torch.from_numpy(std_np).float()
 
     obs_x0, root_quat_init, root_pos_init_xz = positions_to_features(
         interp_positions, mean_abs, std_abs
@@ -430,7 +436,7 @@ def main():
     margs.guidance_param = args.guidance_param
     margs.batch_size = 1
 
-    model, diffusion = create_model_and_diffusion(margs, data)
+    model, diffusion = create_model_and_diffusion(margs, _StubDataLoader())
 
     print(f"Loading checkpoint from: {args.model_path}")
     load_saved_model(model, args.model_path)
@@ -484,7 +490,7 @@ def main():
             for step_idx, step_sample in zip(dump_steps, sample):
                 positions = features_to_positions(
                     step_sample,
-                    inv_transform_fn=t2m_dataset.inv_transform,
+                    inv_transform_fn=inv_transform,
                     abs_3d=model_args.get('abs_3d', True),
                     root_quat_init=root_quat_init,
                     root_pos_init_xz=root_pos_init_xz,
@@ -498,7 +504,7 @@ def main():
             # sample is [1, 263, 1, max_frames]
             positions = features_to_positions(
                 sample,
-                inv_transform_fn=t2m_dataset.inv_transform,
+                inv_transform_fn=inv_transform,
                 abs_3d=model_args.get('abs_3d', True),
                 root_quat_init=root_quat_init,
                 root_pos_init_xz=root_pos_init_xz,
