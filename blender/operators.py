@@ -411,7 +411,7 @@ class DMI_OT_RunInference(Operator):
             "--blender_input", export_path,
             "--output", import_path,
             "--text_prompt", props.text_prompt,
-            "--guidance_param", "2.5",
+            "--guidance_param", f"{props.guidance_param:.4f}",
             "--num_repetitions", "1",
             "--seed", "10",
         ]
@@ -619,6 +619,7 @@ def _apply_joint_positions(joint_positions, context):
 
     context.scene.frame_start = 1
     context.scene.frame_end = n_frames
+    props.frame_count = n_frames
 
     props.keyframes_inferred = json.dumps(_snapshot_keyframes(obj))
     props.active_keyframe_layer = 'INFERRED'
@@ -918,6 +919,17 @@ class DMI_OT_ApplyKeyframeLayer(Operator):
             return {'CANCELLED'}
 
         _apply_keyframes(obj, data)
+
+        if self.layer == 'CONSTRAINED':
+            # The constrained snapshot is sparse — only (frame, bone) positions
+            # that were actually constrained have fcurves. Reset every pose
+            # bone's transform to rest so unkeyed bones fall back to the
+            # default armature pose instead of inheriting the last frame
+            # evaluated from the inferred layer.
+            for pb in obj.pose.bones:
+                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+                pb.location = (0.0, 0.0, 0.0)
+
         props.active_keyframe_layer = self.layer
         self.report({'INFO'}, f"Switched to {self.layer.lower()} keyframes")
         return {'FINISHED'}

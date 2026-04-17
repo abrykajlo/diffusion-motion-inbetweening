@@ -143,6 +143,16 @@ class DMI_Properties(PropertyGroup):
         description="Name used for export/result NPZ files (saved to <project>/blender_inferences/)",
         default="inference",
     )
+    guidance_param: FloatProperty(
+        name="Guidance",
+        description=(
+            "Classifier-free guidance scale for the text prompt. "
+            "1.0 = no guidance; higher values push generation harder toward the prompt"
+        ),
+        default=2.5,
+        min=0.0,
+        soft_max=10.0,
+    )
     show_constraint_list: BoolProperty(
         name="Show Constrained Bones",
         default=False,
@@ -238,6 +248,7 @@ class DMI_PT_Panel(Panel):
         box = layout.box()
         box.label(text="Inference", icon='PLAY')
         box.prop(props, "inference_name")
+        box.prop(props, "guidance_param")
         box.prop(props, "dump_diffusion_steps")
         op_row = box.row(align=True)
         op_row.operator("dmi.run_inference", text="Run Inference", icon='SHADERFX')
